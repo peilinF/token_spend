@@ -1,10 +1,12 @@
 import AppKit
+import Combine
 
 @MainActor
 final class StatusBarController {
     static let shared = StatusBarController()
 
     private var statusItem: NSStatusItem?
+    private var cancellable: AnyCancellable?
 
     func install() {
         guard statusItem == nil else { return }
@@ -12,6 +14,25 @@ final class StatusBarController {
         item.button?.image = NSImage(systemSymbolName: "chart.donut.fill", accessibilityDescription: "TokenSpend")
         item.menu = buildMenu()
         statusItem = item
+
+        cancellable = AppState.shared.$waiting
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.refreshIcon() }
+    }
+
+    private func refreshIcon() {
+        guard let button = statusItem?.button else { return }
+        if AppState.shared.waiting.isEmpty {
+            button.image = NSImage(systemSymbolName: "chart.donut.fill", accessibilityDescription: "TokenSpend")
+            button.contentTintColor = nil
+        } else {
+            let asking = AppState.shared.waiting.values.contains { $0.kind == .question }
+            button.image = NSImage(
+                systemSymbolName: "exclamationmark.circle.fill",
+                accessibilityDescription: asking ? "TokenSpend 等你回答" : "TokenSpend 等待确认"
+            )
+            button.contentTintColor = .systemOrange
+        }
     }
 
     private func buildMenu() -> NSMenu {
@@ -35,6 +56,34 @@ final class StatusBarController {
             menu.addItem(item)
         }
         menu.addItem(.separator())
+
+        let thresholdItem = NSMenuItem(title: "等待检测阈值", action: nil, keyEquivalent: "")
+        let thresholdMenu = NSMenu()
+        for seconds in [30.0, 60.0, 120.0] {
+            let sub = NSMenuItem(
+                title: AppState.shared.waitThreshold == seconds ? "✓ \(Int(seconds))s" : "\(Int(seconds))s",
+                action: #selector(selectThreshold(_:)), keyEquivalent: ""
+            )
+            sub.target = self
+            sub.representedObject = seconds
+            thresholdMenu.addItem(sub)
+        }
+        thresholdItem.submenu = thresholdMenu
+        menu.addItem(thresholdItem)
+
+        let syncItem = NSMenuItem(title: "Cursor 活跃同步间隔", action: nil, keyEquivalent: "")
+        let syncMenu = NSMenu()
+        for seconds in [3.0, 8.0, 15.0, 30.0] {
+            let sub = NSMenuItem(
+                title: AppState.shared.cursorActiveInterval == seconds ? "✓ \(Int(seconds))s" : "\(Int(seconds))s",
+                action: #selector(selectCursorInterval(_:)), keyEquivalent: ""
+            )
+            sub.target = self
+            sub.representedObject = seconds
+            syncMenu.addItem(sub)
+        }
+        syncItem.submenu = syncMenu
+        menu.addItem(syncItem)
 
         let showItem = NSMenuItem(title: "显示悬浮窗", action: #selector(toggleCircle(_:)), keyEquivalent: "")
         showItem.target = self
@@ -73,6 +122,20 @@ final class StatusBarController {
     @objc private func selectMode(_ sender: NSMenuItem) {
         if let raw = sender.representedObject as? String, let mode = UsageMode(rawValue: raw) {
             AppState.shared.mode = mode
+        }
+        rebuild()
+    }
+
+    @objc private func selectThreshold(_ sender: NSMenuItem) {
+        if let seconds = sender.representedObject as? Double {
+            AppState.shared.waitThreshold = seconds
+        }
+        rebuild()
+    }
+
+    @objc private func selectCursorInterval(_ sender: NSMenuItem) {
+        if let seconds = sender.representedObject as? Double {
+            AppState.shared.cursorActiveInterval = seconds
         }
         rebuild()
     }

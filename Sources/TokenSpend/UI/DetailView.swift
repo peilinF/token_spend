@@ -36,6 +36,9 @@ struct DetailView: View {
 
     private var pickers: some View {
         VStack(alignment: .leading, spacing: 8) {
+            if !state.waiting.isEmpty {
+                waitingBanner
+            }
             Picker("", selection: Binding(get: { state.period }, set: { state.period = $0 })) {
                 ForEach(Period.allCases, id: \.self) { Text($0.shortName).tag($0) }
             }
@@ -53,6 +56,37 @@ struct DetailView: View {
                     .foregroundStyle(.secondary)
             }
         }
+    }
+
+    private var waitingBanner: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "hourglass")
+                .font(.system(size: 10, weight: .bold))
+                .foregroundColor(.orange)
+            Text(bannerText)
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundColor(.orange)
+                .lineLimit(1)
+            Spacer()
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 5)
+        .background(RoundedRectangle(cornerRadius: 8).fill(Color.orange.opacity(0.14)))
+    }
+
+    private var bannerText: String {
+        state.waiting
+            .sorted(by: { $0.key.rawValue < $1.key.rawValue })
+            .map { tool, info in
+                switch info.kind {
+                case .question:
+                    return "\(tool.displayName) \(info.kind.label)"
+                case .stalled:
+                    let secs = Int(Date().timeIntervalSince(info.since))
+                    return "\(tool.displayName) \(info.kind.label) \(secs)s"
+                }
+            }
+            .joined(separator: " · ")
     }
 
     private var totalBlock: some View {
@@ -94,8 +128,14 @@ struct DetailView: View {
                         .frame(width: 5, height: 5)
                         .modifier(PulseEffect())
                 }
+                if let info = state.waiting[item.tool] {
+                    Image(systemName: "hourglass")
+                        .font(.system(size: 9, weight: .bold))
+                        .foregroundColor(.orange)
+                        .help(item.tool.displayName + " " + info.kind.label)
+                }
                 Spacer()
-                if item.tool == .opencode && item.amount.cost > 0 {
+                if item.amount.cost > 0 {
                     Text(Fmt.money(item.amount.cost))
                         .font(.system(size: 10))
                         .foregroundStyle(.secondary)
@@ -164,14 +204,23 @@ struct DetailView: View {
     }
 
     private var footer: some View {
-        HStack(spacing: 6) {
+        HStack(alignment: .top, spacing: 6) {
             Circle()
                 .fill(authColor)
                 .frame(width: 6, height: 6)
-            Text("cursor: " + state.cursorAuth.message)
-                .font(.system(size: 10))
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
+                .padding(.top, 3)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("cursor: " + state.cursorAuth.message)
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                if let extra = footerMeta, !extra.isEmpty {
+                    Text(extra)
+                        .font(.system(size: 9))
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(1)
+                }
+            }
             Spacer()
             Button {
                 Task { await state.refreshAll(force: true) }
@@ -184,11 +233,22 @@ struct DetailView: View {
         }
     }
 
+    private var footerMeta: String? {
+        var parts: [String] = []
+        if case .ok(let expiry) = state.cursorAuth, let expiry {
+            parts.append("过期 " + Fmt.shortDate(expiry))
+        }
+        if let sync = state.cursorLastSync {
+            parts.append("同步 " + Fmt.time(sync))
+        }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
+    }
+
     private var authColor: Color {
         switch state.cursorAuth {
         case .ok: return .green
-        case .needsRelogin, .keychainDenied: return .orange
-        case .noChrome, .error: return .gray
+        case .needsRelogin, .keychainDenied, .unsupportedCookie: return .orange
+        case .noChrome, .error, .unknown: return .gray
         }
     }
 

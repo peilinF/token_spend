@@ -56,6 +56,13 @@ final class UsageStore {
         ) { _ in }
     }
 
+    func deleteAll(source: Tool) {
+        guard let db = db else { return }
+        ioLock.lock()
+        defer { ioLock.unlock() }
+        try? db.query("DELETE FROM contrib WHERE source=?", binds: [.text(source.rawValue)]) { _ in }
+    }
+
     func deleteSourceKeys(source: Tool, keyPrefix: String) {
         guard let db = db else { return }
         ioLock.lock()

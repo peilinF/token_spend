@@ -105,6 +105,23 @@ struct UsageAmount: AdditiveArithmetic {
     }
 }
 
+enum WaitingKind: Equatable {
+    case question
+    case stalled
+
+    var label: String {
+        switch self {
+        case .question: return "等你回答"
+        case .stalled: return "疑似等待确认"
+        }
+    }
+}
+
+struct WaitingInfo: Equatable {
+    let kind: WaitingKind
+    let since: Date
+}
+
 struct ToolSummary: Identifiable {
     let tool: Tool
     let amount: UsageAmount

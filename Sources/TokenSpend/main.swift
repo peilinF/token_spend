@@ -16,6 +16,19 @@ if arguments.contains("--reconcile") {
     exit(0)
 }
 
+if arguments.contains("--print-waiting") {
+    let threshold = UserDefaults.standard.object(forKey: "wait_threshold") as? TimeInterval ?? 60
+    let detected = WaitingDetector.detect(threshold: threshold)
+    if detected.isEmpty {
+        print("waiting: none")
+    } else {
+        for (tool, kind) in detected.sorted(by: { $0.key.rawValue < $1.key.rawValue }) {
+            print("waiting \(tool.rawValue): \(kind.label)")
+        }
+    }
+    exit(0)
+}
+
 if arguments.contains("--print-live") {    var done = false
     Task { @MainActor in
         let state = AppState.shared
