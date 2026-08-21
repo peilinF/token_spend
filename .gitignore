@@ -1,0 +1,8 @@
+.build/
+build/
+.DS_Store
+*.pem
+*.p12
+*.cer
+swiftpm/
+Package.resolved

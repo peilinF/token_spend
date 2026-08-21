@@ -1,0 +1,4 @@
+module CCrypto {
+    header "../shim.h"
+    export *
+}
