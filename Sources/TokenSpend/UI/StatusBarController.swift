@@ -17,7 +17,10 @@ final class StatusBarController {
 
         cancellable = AppState.shared.$waiting
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] _ in self?.refreshIcon() }
+            .sink { [weak self] _ in
+                self?.refreshIcon()
+                self?.rebuild()
+            }
     }
 
     private func refreshIcon() {
@@ -38,6 +41,21 @@ final class StatusBarController {
     private func buildMenu() -> NSMenu {
         let state = AppState.shared
         let menu = NSMenu()
+
+        let waiting = state.waiting
+        if !waiting.isEmpty {
+            let summary = waiting
+                .sorted(by: { $0.key.rawValue < $1.key.rawValue })
+                .map { tool, info in "\(tool.displayName)·\(info.kind == .question ? "答" : "疑")" }
+                .joined(separator: " / ")
+            let statusLine = NSMenuItem(
+                title: "⏳ \(waiting.count) 个在等：\(summary)",
+                action: nil, keyEquivalent: ""
+            )
+            statusLine.isEnabled = false
+            menu.addItem(statusLine)
+            menu.addItem(.separator())
+        }
 
         for period in Period.allCases {
             let item = NSMenuItem(title: period.displayName, action: #selector(selectPeriod(_:)), keyEquivalent: "")

@@ -54,9 +54,25 @@ struct CircleView: View {
                     .minimumScaleFactor(0.6)
                     .padding(.horizontal, 12)
                 if isWaiting {
-                    Text(waitingCaption)
-                        .font(.system(size: 9, weight: .bold))
-                        .foregroundColor(.orange)
+                    if state.waiting.count > 1 {
+                        VStack(spacing: 1) {
+                            Text("⏳\(state.waiting.count)")
+                                .font(.system(size: 9, weight: .bold))
+                                .foregroundColor(.orange)
+                            HStack(spacing: 2) {
+                                ForEach(state.waiting.keys.sorted(by: { $0.rawValue < $1.rawValue }), id: \.self) { tool in
+                                    Circle()
+                                        .fill(tool.color)
+                                        .frame(width: 3.5, height: 3.5)
+                                        .modifier(PulseEffect())
+                                }
+                            }
+                        }
+                    } else {
+                        Text(waitingCaption)
+                            .font(.system(size: 9, weight: .bold))
+                            .foregroundColor(.orange)
+                    }
                 } else {
                     Text(state.period.displayName)
                         .font(.system(size: 9, weight: .medium))

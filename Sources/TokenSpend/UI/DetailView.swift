@@ -66,27 +66,38 @@ struct DetailView: View {
             Text(bannerText)
                 .font(.system(size: 10, weight: .semibold))
                 .foregroundColor(.orange)
-                .lineLimit(1)
-            Spacer()
+                .lineLimit(2)
+                .fixedSize(horizontal: false, vertical: true)
+                .multilineTextAlignment(.leading)
+            Spacer(minLength: 0)
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 5)
         .background(RoundedRectangle(cornerRadius: 8).fill(Color.orange.opacity(0.14)))
     }
 
-    private var bannerText: String {
+    private var sortedWaiting: [(tool: Tool, info: WaitingInfo)] {
         state.waiting
-            .sorted(by: { $0.key.rawValue < $1.key.rawValue })
-            .map { tool, info in
-                switch info.kind {
-                case .question:
-                    return "\(tool.displayName) \(info.kind.label)"
-                case .stalled:
-                    let secs = Int(Date().timeIntervalSince(info.since))
-                    return "\(tool.displayName) \(info.kind.label) \(secs)s"
+            .map { ($0.key, $0.value) }
+            .sorted { a, b in
+                if a.info.kind != b.info.kind {
+                    return a.info.kind == .question
                 }
+                return a.info.since < b.info.since
             }
-            .joined(separator: " · ")
+    }
+
+    private var bannerText: String {
+        sortedWaiting.map { tool, info in
+            switch info.kind {
+            case .question:
+                return "\(tool.displayName) \(info.kind.label)"
+            case .stalled:
+                let secs = Int(Date().timeIntervalSince(info.since))
+                return "\(tool.displayName) 疑似 \(secs)s"
+            }
+        }
+        .joined(separator: " · ")
     }
 
     private var totalBlock: some View {
