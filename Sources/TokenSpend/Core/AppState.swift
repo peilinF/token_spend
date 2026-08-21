@@ -141,7 +141,7 @@ final class AppState: ObservableObject {
     func refreshLocal() async {
         let store = self.store
         try? await Task.detached(priority: .utility) {
-            try OpenCodeSource.refresh(store: store)
+            try OpenCodeSource.refresh(store: store, overlapMS: 120_000)
             try CodexSource.refresh(store: store)
         }.value
         recompute()
@@ -174,7 +174,7 @@ final class AppState: ObservableObject {
         }
 
         try? await Task.detached(priority: .utility) {
-            try OpenCodeSource.refresh(store: store)
+            try OpenCodeSource.refresh(store: store, overlapMS: 15_000)
             try CodexSource.refresh(store: store)
         }.value
         recompute()

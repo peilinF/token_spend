@@ -30,11 +30,11 @@ enum OpenCodeSource {
         store.deleteSourceKeysNotIn(source: .opencode, validKeys: ids)
     }
 
-    static func refresh(store: UsageStore) throws {
+    static func refresh(store: UsageStore, overlapMS: Int64 = 120_000) throws {
         guard FileManager.default.fileExists(atPath: dbPath) else { return }
         let db = try SQLiteDatabase(path: dbPath, readonly: true)
         let watermark = Double(store.meta("oc_wm") ?? "0") ?? 0
-        let since = Int64(max(0, watermark - 120_000))
+        let since = Int64(max(0, watermark - Double(overlapMS)))
 
         var maxUpdated: Int64 = Int64(watermark)
         try db.query(
