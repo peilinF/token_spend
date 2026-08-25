@@ -9,27 +9,22 @@ final class AppState: ObservableObject {
     @Published var period: Period {
         didSet {
             UserDefaults.standard.set(period.rawValue, forKey: "period")
-            samples.removeAll()
-            cursorSyncSamples.removeAll()
-            cursorHeldRate = nil
             recompute()
         }
     }
     @Published var mode: UsageMode {
         didSet {
             UserDefaults.standard.set(mode.rawValue, forKey: "mode")
-            samples.removeAll()
-            cursorSyncSamples.removeAll()
-            cursorHeldRate = nil
             recompute()
         }
     }
     @Published private(set) var summary: PeriodSummary?
     @Published private(set) var cursorAuth: CursorAuthState = CursorSource.lastAuthState
-    @Published private(set) var cursorLastSync: Date?
     @Published private(set) var lastUpdated: Date?
-    @Published private(set) var liveRates: [Tool: Int64] = [:]
+    @Published private(set) var cursorLastSync: Date?
+    // Do not add liveRates / +xx/m. Product decision: no per-minute token rate.
     @Published private(set) var activeTools: Set<Tool> = []
+    @Published private(set) var activeSince: [Tool: Date] = [:]
     @Published private(set) var waiting: [Tool: WaitingInfo] = [:]
     @Published var isDetailVisible = false
 
@@ -45,21 +40,25 @@ final class AppState: ObservableObject {
 
     private let store = UsageStore.shared
     private let waitMonitor = WaitingMonitor()
+    private let activityWatcher = ActivityWatcher()
     private var localTimer: Timer?
     private var cursorTimer: Timer?
     private var liveTimer: Timer?
     private var waitTimer: Timer?
     private var reconcileTimer: Timer?
-    private var samples: [(date: Date, totals: [Tool: Int64])] = []
+    private var expiryTimer: Timer?
     private var isPolling = false
     private var isWaitingPolling = false
     private var waitingSince: [Tool: Date] = [:]
+    private var lastSeenActivity: [Tool: Date] = [:]
+    private var opencodeIdleStrikes = 0
+    // Must outlast the 3s live poll. 1.8s caused the green arc to blink off
+    // between polls whenever the WAL was quiet during thinking.
+    private let quietTimeout: TimeInterval = 14
     private var cursorFailures = 0
     private var cursorNextAttempt = Date.distantPast
     private var lastCursorRefresh = Date.distantPast
     private var isRefreshingCursor = false
-    private var cursorSyncSamples: [(date: Date, total: Int64)] = []
-    private var cursorHeldRate: Int64?
     private var lastWakeRefresh = Date.distantPast
 
     init() {
@@ -92,6 +91,13 @@ final class AppState: ObservableObject {
         reconcileTimer = Timer.scheduledTimer(withTimeInterval: 3600, repeats: true) { _ in
             Task { await AppState.shared.runReconcile() }
         }
+        expiryTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { _ in
+            Task { await AppState.shared.recomputeActiveTools() }
+        }
+        activityWatcher.onActivity = { tool in
+            Task { @MainActor in AppState.shared.markSeen(tool) }
+        }
+        activityWatcher.start()
         Task { await refreshAll() }
         Task {
             try? await Task.sleep(nanoseconds: 90_000_000_000)
@@ -148,6 +154,24 @@ final class AppState: ObservableObject {
         lastUpdated = Date()
     }
 
+    func markSeen(_ tool: Tool) {
+        lastSeenActivity[tool] = Date()
+        recomputeActiveTools()
+    }
+
+    private func recomputeActiveTools() {
+        let now = Date()
+        let effective = Set(lastSeenActivity.filter { now.timeIntervalSince($0.value) < quietTimeout }.map(\.key))
+        guard effective != activeTools else { return }
+        for tool in effective where activeSince[tool] == nil {
+            activeSince[tool] = now
+        }
+        for tool in activeSince.keys where !effective.contains(tool) {
+            activeSince.removeValue(forKey: tool)
+        }
+        activeTools = effective
+    }
+
     func pollLive() async {
         guard !isPolling else { return }
         isPolling = true
@@ -156,16 +180,31 @@ final class AppState: ObservableObject {
         let store = self.store
         let activity = try? await Task.detached(priority: .utility) { () -> Set<Tool> in
             var active: Set<Tool> = []
-            if OpenCodeSource.isActive(within: 12) { active.insert(.opencode) }
-            if CodexSource.isActive(within: 12) { active.insert(.codex) }
+            if OpenCodeSource.isActive(within: 4) { active.insert(.opencode) }
+            if CodexSource.isActive(within: 4) { active.insert(.codex) }
+            // 12s only guards the legacy fallback for cursor logs without
+            // streamFromAgentBackend spans; turn spans decide otherwise.
             if CursorSource.isActive(within: 12) { active.insert(.cursor) }
             return active
         }.value
         if let activity {
-            if activity != activeTools {
-                activeTools = activity
+            let now = Date()
+            for tool in activity {
+                lastSeenActivity[tool] = now
             }
-            if activity.contains(.cursor),
+            // Turn-level completion is definitive: drop the tool now instead of
+            // letting quietTimeout keep the arc lit for another 14s.
+            if !activity.contains(.codex) { lastSeenActivity.removeValue(forKey: .codex) }
+            if !activity.contains(.cursor) { lastSeenActivity.removeValue(forKey: .cursor) }
+            if activity.contains(.opencode) {
+                opencodeIdleStrikes = 0
+            } else {
+                // "No running part" is heuristic, so confirm idle twice.
+                opencodeIdleStrikes += 1
+                if opencodeIdleStrikes >= 2 { lastSeenActivity.removeValue(forKey: .opencode) }
+            }
+            recomputeActiveTools()
+            if activeTools.contains(.cursor),
                Date().timeIntervalSince(lastCursorRefresh) >= cursorActiveInterval,
                Date() >= cursorNextAttempt {
                 lastCursorRefresh = Date()
@@ -178,7 +217,7 @@ final class AppState: ObservableObject {
             try CodexSource.refresh(store: store)
         }.value
         recompute()
-        recordLiveSample()
+        // No recordLiveSample / +xx/m. Rate UI was removed on purpose.
     }
 
     func refreshCursor(force: Bool = false) async {
@@ -197,7 +236,6 @@ final class AppState: ObservableObject {
             cursorLastSync = Date()
             cursorFailures = 0
             cursorNextAttempt = .distantPast
-            recordCursorSnapshot()
         } catch KeychainError.denied {
             cursorAuth = .keychainDenied
             applyCursorBackoff(seconds: 1800)
@@ -217,62 +255,7 @@ final class AppState: ObservableObject {
         }
         recompute()
         lastUpdated = Date()
-        recordLiveSample()
-    }
-
-    private func recordLiveSample() {
-        let now = Date()
-        let range = PeriodMath.range(of: period, now: now)
-        let totals = store.dailyTotals(sinceDay: Fmt.day(range.start))
-        var current: [Tool: Int64] = [:]
-        for tool in Tool.allCases where tool != .cursor {
-            let sum = (totals[tool]?.values.reduce(.zero, +) ?? .zero).total(mode: mode)
-            current[tool] = sum
-        }
-
-        samples.append((now, current))
-        samples = samples.filter { now.timeIntervalSince($0.date) < 90 }
-
-        var rates: [Tool: Int64] = [:]
-        if let oldest = samples.first, now.timeIntervalSince(oldest.date) >= 8 {
-            let minutes = now.timeIntervalSince(oldest.date) / 60
-            for (tool, value) in current {
-                let delta = value - (oldest.totals[tool] ?? 0)
-                if delta > 0 {
-                    rates[tool] = Int64(Double(delta) / minutes)
-                }
-            }
-        }
-        if let held = cursorHeldRate, held > 0 {
-            rates[.cursor] = held
-        }
-        if rates != liveRates {
-            liveRates = rates
-        }
-    }
-
-    private func recordCursorSnapshot() {
-        let now = Date()
-        let range = PeriodMath.range(of: period, now: now)
-        let totals = store.dailyTotals(sinceDay: Fmt.day(range.start))
-        let total = (totals[.cursor]?.values.reduce(.zero, +) ?? .zero).total(mode: mode)
-
-        cursorSyncSamples.append((now, total))
-        cursorSyncSamples = cursorSyncSamples.filter { now.timeIntervalSince($0.date) < 300 }
-
-        guard let oldest = cursorSyncSamples.first else { return }
-        let elapsed = now.timeIntervalSince(oldest.date)
-        guard elapsed >= 8 else { return }
-        let delta = total - oldest.total
-
-        if delta < 0 {
-            cursorSyncSamples = [(now, total)]
-            cursorHeldRate = nil
-        } else if delta > 0 {
-            cursorHeldRate = Int64(Double(delta) / (elapsed / 60))
-        } else if !activeTools.contains(.cursor) {
-            cursorHeldRate = nil
-        }
+        // No per-minute rate sampling. Do not restore liveRates / +xx/m.
     }
 
     private func applyWaiting(_ detected: [Tool: WaitingKind]) {

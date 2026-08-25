@@ -13,8 +13,22 @@ enum OpenCodeSource {
         try? db.query("SELECT MAX(time_updated) FROM part", binds: []) { row in
             maxUpdated = row.double(0)
         }
-        guard maxUpdated > 0 else { return false }
-        return Date(timeIntervalSince1970: maxUpdated / 1000) > Date().addingTimeInterval(-interval)
+        if maxUpdated > 0,
+           Date(timeIntervalSince1970: maxUpdated / 1000) > Date().addingTimeInterval(-interval) {
+            return true
+        }
+
+        // Thinking often does not bump MAX(time_updated) every second. A live
+        // opencode process plus a recently-running part still means consuming.
+        guard WaitingDetector.processAlive(named: "opencode") else { return false }
+        let since = Int64(Date().addingTimeInterval(-180).timeIntervalSince1970 * 1000)
+        var running = false
+        try? db.query(
+            "SELECT 1 FROM part WHERE time_updated >= ? AND length(data) < 200000 " +
+            "AND data LIKE '%\"status\":\"running\"%' LIMIT 1",
+            binds: [.int(since)]
+        ) { _ in running = true }
+        return running
     }
 
     static func reconcile(store: UsageStore) {

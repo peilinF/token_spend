@@ -19,7 +19,7 @@
 ## 功能
 
 - **悬浮圆窗**：置顶、全 Space 显示、可拖动（位置记忆）、进度环显示当前周期流逝
-- **实时活动指示**：哪个工具正在工作，对应颜色的脉冲点就亮起；token 高速消耗时显示 `+xxM/m` 速率
+- **实时活动指示**：哪个工具正在消耗，对应颜色的能量环弧段绕圆窗连续旋转（空闲时零开销），详情面板显示 `消耗中·Ns`。不显示每分钟 token 速率（`+xx/m` 已取消，不要恢复）
 - **周期切换**：今日 / 本周（周一起始）/ 本月 / 今年，本地时区
 - **双统计口径**：
   - 精简 = input（不含 cache）+ output —— 反映真实生成量
@@ -95,11 +95,9 @@ rm key.pem cert.pem
 |---|---|---|
 | opencode/codex 增量 | 30s + 实时轮询 3s | 毫秒级增量，无 IO 压力 |
 | cursor API（空闲） | 300s | 失败指数退避至 60min |
-| cursor API（活跃） | 默认 8s，可调 3-30s | 检测到 cursor 正在工作时自动加速，速率显示滞后 ≤8s |
+| cursor API（活跃） | 默认 8s，可调 3-30s | 检测到 cursor 正在工作时自动加速，保证今日总量 ≤8s 新鲜 |
 | 缓存对账清理 | 1h | 清理源数据已删除的残留行 |
 | 睡眠唤醒 | 60s 节流 | 唤醒后全量刷新一次 |
-
-cursor 的 `+x/m` 速率基于成功同步时的总量快照差分（5 分钟窗口），两次同步之间保持上次数值不闪断。
 
 ## 隐私与安全
 
@@ -110,7 +108,7 @@ cursor 的 `+x/m` 速率基于成功同步时的总量快照差分（5 分钟窗
 
 ## 已知限制
 
-- cursor 的 token 速率依赖官网 usage API（活跃时约 3 秒一刷），圆窗 `+xx/m` 是当前所有正在消耗的工具之和
+- cursor 的 token 统计依赖官网 usage API（活跃时约 8 秒一刷，空闲 5 分钟）
 - cursor 初次同步回溯 400 天，更早的历史无法获取
 - Cursor 官网接口为非官方逆向，若失效需跟进适配
 - codex 统计口径为各 `token_count` 事件增量求和，与官方 dashboard 可能存在微小差异
@@ -124,6 +122,7 @@ Sources/TokenSpend/
 ├── Core/
 │   ├── Models.swift        # Tool/Period/UsageMode/聚合模型
 │   ├── AppState.swift      # 状态机、定时器、退避、采样
+│   ├── ActivityWatcher.swift # 文件变更即时点亮活动环
 │   ├── UsageStore.swift    # 自有 SQLite 缓存（contrib/meta）
 │   ├── WaitingDetector.swift # 等待确认 / 停滞检测
 │   ├── SQLite.swift        # sqlite3 C API 薄封装

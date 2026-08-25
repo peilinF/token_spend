@@ -44,8 +44,8 @@ final class PanelController {
 
     private func setupCircle() {
         let view = NSHostingView(rootView: CircleView(state: state))
-        view.setFrameSize(NSSize(width: 92, height: 92))
-        circlePanel = makePanel(view, size: NSSize(width: 92, height: 92))
+        view.setFrameSize(NSSize(width: 136, height: 136))
+        circlePanel = makePanel(view, size: NSSize(width: 136, height: 136))
         if let saved = loadOrigin(key: "circle_origin") {
             circlePanel.setFrameTopLeftPoint(saved)
             ensureOnScreen()

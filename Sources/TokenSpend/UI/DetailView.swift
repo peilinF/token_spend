@@ -154,12 +154,33 @@ struct DetailView: View {
                 Text(Fmt.tokens(value))
                     .font(.system(size: 11, weight: .semibold, design: .rounded))
                     .monospacedDigit()
-                if let rate = state.liveRates[item.tool] {
-                    Text("+" + Fmt.tokens(rate) + "/m")
-                        .font(.system(size: 9, weight: .medium, design: .rounded))
-                        .monospacedDigit()
-                        .foregroundStyle(item.tool.color)
-                        .modifier(PulseEffect())
+                // No +xx/m per tool. Rate UI was removed on purpose; do not restore.
+                if let since = state.activeSince[item.tool] {
+                    let secs = Int(Date().timeIntervalSince(since))
+                    HStack(spacing: 3) {
+                        Circle()
+                            .fill(item.tool.color)
+                            .frame(width: 6, height: 6)
+                            .shadow(color: item.tool.color.opacity(0.85), radius: 4)
+                            .overlay(Circle().fill(.white).frame(width: 2.2, height: 2.2))
+                        Text("消耗中·\(secs)s")
+                            .font(.system(size: 9, weight: .heavy, design: .rounded))
+                            .monospacedDigit()
+                    }
+                    .foregroundStyle(item.tool.color)
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 3)
+                    .background(
+                        Capsule()
+                            .fill(
+                                LinearGradient(
+                                    colors: [item.tool.color.opacity(0.18), item.tool.color.opacity(0.06)],
+                                    startPoint: .leading, endPoint: .trailing
+                                )
+                            )
+                            .overlay(Capsule().stroke(item.tool.color.opacity(0.28), lineWidth: 0.8))
+                            .shadow(color: item.tool.color.opacity(0.35), radius: 5)
+                    )
                 }
             }
             GeometryReader { geo in

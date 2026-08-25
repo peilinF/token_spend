@@ -33,9 +33,48 @@ enum CookieCryptoError: Error {
 
 enum CursorSource {
     static func isActive(within interval: TimeInterval) -> Bool {
-        let cutoff = Date().addingTimeInterval(-interval)
-        guard let newest = CursorLogs.requestTraceLogs(newerThan: cutoff).first else { return false }
-        return tailHasRecentAgentActivity(newest.url, cutoff: cutoff)
+        let now = Date()
+        guard let newest = CursorLogs.requestTraceLogs(newerThan: now.addingTimeInterval(-1800)).first else { return false }
+        switch tailStreamSpanState(newest.url) {
+        case .open:
+            return true
+        case .closed:
+            // The last agent stream has ended; any other fresh markers are just
+            // its trailing writes. Stop instead of riding the window out.
+            return false
+        case .absent:
+            break
+        }
+        return tailHasRecentAgentActivity(newest.url, cutoff: now.addingTimeInterval(-interval))
+    }
+
+    private enum StreamSpanState {
+        case open
+        case closed
+        case absent
+    }
+
+    // streamFromAgentBackend spans bracket an agent request end to end; the
+    // later of the last start/complete lines decides if cursor is mid-turn.
+    private static func tailStreamSpanState(_ url: URL) -> StreamSpanState {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return .absent }
+        defer { try? handle.close() }
+        let size = Int64((try? handle.seekToEnd()) ?? 0)
+        try? handle.seek(toOffset: UInt64(max(0, size - 2_000_000)))
+        guard let data = try? handle.readToEnd(),
+              let text = String(data: data, encoding: .utf8) else { return .absent }
+        let started = text.range(of: "span_started name=\"streamFromAgentBackend\"", options: .backwards)?.lowerBound
+        let completed = text.range(of: "span_completed name=\"streamFromAgentBackend\"", options: .backwards)?.lowerBound
+        switch (started, completed) {
+        case let (s?, c?):
+            return s > c ? .open : .closed
+        case (.some, nil):
+            return .open
+        case (nil, .some):
+            return .closed
+        default:
+            return .absent
+        }
     }
 
     private static func tailHasRecentAgentActivity(_ url: URL, cutoff: Date) -> Bool {

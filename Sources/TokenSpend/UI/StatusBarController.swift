@@ -1,6 +1,10 @@
 import AppKit
 import Combine
 
+extension Tool {
+    var menuBarColor: NSColor { NSColor(color) }
+}
+
 @MainActor
 final class StatusBarController {
     static let shared = StatusBarController()
@@ -25,16 +29,27 @@ final class StatusBarController {
 
     private func refreshIcon() {
         guard let button = statusItem?.button else { return }
-        if AppState.shared.waiting.isEmpty {
+        let waiting = AppState.shared.waiting
+        if waiting.isEmpty {
             button.image = NSImage(systemSymbolName: "chart.donut.fill", accessibilityDescription: "TokenSpend")
             button.contentTintColor = nil
+            button.attributedTitle = NSAttributedString(string: "")
+            button.toolTip = nil
         } else {
-            let asking = AppState.shared.waiting.values.contains { $0.kind == .question }
+            let asking = waiting.values.contains { $0.kind == .question }
             button.image = NSImage(
                 systemSymbolName: "exclamationmark.circle.fill",
                 accessibilityDescription: asking ? "TokenSpend 等你回答" : "TokenSpend 等待确认"
             )
             button.contentTintColor = .systemOrange
+            let sorted = waiting.keys.sorted(by: { $0.rawValue < $1.rawValue })
+            let dots = NSMutableAttributedString(string: " ")
+            for tool in sorted {
+                dots.append(NSAttributedString(string: "● ", attributes: [.foregroundColor: tool.menuBarColor]))
+            }
+            button.attributedTitle = dots
+            let names = sorted.map(\.displayName).joined(separator: "、")
+            button.toolTip = names + (asking ? " 等你回答" : " 等待确认")
         }
     }
 

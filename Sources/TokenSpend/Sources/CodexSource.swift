@@ -2,19 +2,45 @@ import Foundation
 
 enum CodexSource {
     static func isActive(within interval: TimeInterval) -> Bool {
-        let sessionsDir = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".codex/sessions")
-        guard FileManager.default.fileExists(atPath: sessionsDir.path) else { return false }
-        let cutoff = Date().addingTimeInterval(-interval)
-        let enumerator = FileManager.default.enumerator(at: sessionsDir, includingPropertiesForKeys: [.contentModificationDateKey])
-        while let next = enumerator?.nextObject() {
-            if let url = next as? URL, url.pathExtension == "jsonl",
-               let mtime = try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate,
-               mtime > cutoff {
-                return true
+        guard let newest = newestSessionFile(),
+              let mtime = try? newest.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
+        else { return false }
+        let now = Date()
+        if mtime > now.addingTimeInterval(-1800), let marker = lastTaskMarker(newest) {
+            // Markers bracket each turn and beat mtime: task_complete ends the
+            // turn even though the completion write itself is still fresh.
+            switch marker {
+            case .started:
+                return WaitingDetector.processAlive(named: "codex")
+            case .completed:
+                return false
             }
         }
-        return false
+        return mtime > now.addingTimeInterval(-interval)
+    }
+
+    private enum TaskMarker {
+        case started
+        case completed
+    }
+
+    private static func lastTaskMarker(_ file: URL) -> TaskMarker? {
+        guard let handle = try? FileHandle(forReadingFrom: file) else { return nil }
+        defer { try? handle.close() }
+        let size = Int64((try? handle.seekToEnd()) ?? 0)
+        try? handle.seek(toOffset: UInt64(max(0, size - 2_000_000)))
+        guard let data = try? handle.readToEnd(),
+              let text = String(data: data, encoding: .utf8) else { return nil }
+        let started = text.range(of: "\"type\":\"task_started\"", options: .backwards)?.lowerBound
+        let completed = text.range(of: "\"type\":\"task_complete\"", options: .backwards)?.lowerBound
+        switch (started, completed) {
+        case let (s?, c?):
+            return s > c ? .started : .completed
+        case (.some, nil):
+            return .started
+        default:
+            return nil
+        }
     }
 
     static func reconcile(store: UsageStore) {
@@ -34,6 +60,25 @@ enum CodexSource {
             }
         }
         store.deleteSourceKeysNotIn(source: .codex, validKeys: valid)
+    }
+
+    static func newestSessionFile() -> URL? {
+        let sessionsDir = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".codex/sessions")
+        guard FileManager.default.fileExists(atPath: sessionsDir.path) else { return nil }
+        let enumerator = FileManager.default.enumerator(
+            at: sessionsDir, includingPropertiesForKeys: [.contentModificationDateKey]
+        )
+        var newest: (url: URL, mtime: Date)?
+        while let next = enumerator?.nextObject() {
+            if let url = next as? URL, url.pathExtension == "jsonl",
+               let mtime = try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate {
+                if newest == nil || mtime > newest!.mtime {
+                    newest = (url, mtime)
+                }
+            }
+        }
+        return newest?.url
     }
 
     static func refresh(store: UsageStore) throws {

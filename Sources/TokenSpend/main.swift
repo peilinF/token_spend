@@ -35,11 +35,15 @@ if arguments.contains("--print-live") {    var done = false
         await state.pollLive()
         try? await Task.sleep(nanoseconds: 8_000_000_000)
         await state.pollLive()
-        print("active: \(state.activeTools.sorted(by: { $0.rawValue < $1.rawValue }).map(\.rawValue).joined(separator: ","))")
-        for (tool, rate) in state.liveRates.sorted(by: { $0.key.rawValue < $1.key.rawValue }) {
-            print("live \(tool.rawValue): +\(rate)/min")
+        if state.activeTools.isEmpty {
+            print("idle")
+        } else {
+            for tool in state.activeTools.sorted(by: { $0.rawValue < $1.rawValue }) {
+                let secs = Int(Date().timeIntervalSince(state.activeSince[tool] ?? Date()))
+                print("consuming \(tool.rawValue) \(secs)s")
+            }
+            // No +xx/m in --print-live. Rate UI was removed on purpose; do not restore.
         }
-        if state.liveRates.isEmpty { print("live: idle") }
         done = true
     }
     while !done {
