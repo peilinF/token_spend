@@ -12,6 +12,7 @@ extension Tool {
 
 struct CircleView: View {
     @ObservedObject var state: AppState
+    @ObservedObject var panel: PanelController
     @State private var blink = false
 
     private var isWaiting: Bool { !state.waiting.isEmpty }
@@ -31,7 +32,7 @@ struct CircleView: View {
 
     var body: some View {
         ZStack {
-            ActivityArcsView(tools: state.activeTools.sorted(by: { $0.rawValue < $1.rawValue }))
+            ActivityArcsView(tools: state.activeTools.sorted(by: { $0.rawValue < $1.rawValue }), paused: panel.circleOccluded)
                 .allowsHitTesting(false)
 
             ZStack {
@@ -124,10 +125,11 @@ struct CircleView: View {
 
 struct ActivityArcsView: View {
     let tools: [Tool]
+    let paused: Bool
     @State private var glowPulse = false
 
     var body: some View {
-        TimelineView(.animation(minimumInterval: 1.0 / 60, paused: tools.isEmpty)) { timeline in
+        TimelineView(.animation(minimumInterval: 1.0 / 30, paused: paused || tools.isEmpty)) { timeline in
             let t = timeline.date.timeIntervalSinceReferenceDate
             let spin = (t * 115).truncatingRemainder(dividingBy: 360)
             let wobble = sin(t * 3.2) * 0.7 + 0.3

@@ -26,7 +26,7 @@ final class ActivityWatcher {
 
     func stop() {
         retargetTimer?.cancel()
-        for key in watches.keys { unwatch(key) }
+        for key in Array(watches.keys) { unwatch(key) }
         started = false
     }
 
@@ -45,7 +45,7 @@ final class ActivityWatcher {
                 watch(tool, path: path, key: key)
             }
         }
-        for key in watches.keys where !desired.contains(key) {
+        for key in Array(watches.keys) where !desired.contains(key) {
             unwatch(key)
         }
     }

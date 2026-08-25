@@ -57,23 +57,25 @@ enum CursorSource {
     // streamFromAgentBackend spans bracket an agent request end to end; the
     // later of the last start/complete lines decides if cursor is mid-turn.
     private static func tailStreamSpanState(_ url: URL) -> StreamSpanState {
-        guard let handle = try? FileHandle(forReadingFrom: url) else { return .absent }
-        defer { try? handle.close() }
-        let size = Int64((try? handle.seekToEnd()) ?? 0)
-        try? handle.seek(toOffset: UInt64(max(0, size - 2_000_000)))
-        guard let data = try? handle.readToEnd(),
-              let text = String(data: data, encoding: .utf8) else { return .absent }
-        let started = text.range(of: "span_started name=\"streamFromAgentBackend\"", options: .backwards)?.lowerBound
-        let completed = text.range(of: "span_completed name=\"streamFromAgentBackend\"", options: .backwards)?.lowerBound
-        switch (started, completed) {
-        case let (s?, c?):
-            return s > c ? .open : .closed
-        case (.some, nil):
-            return .open
-        case (nil, .some):
-            return .closed
-        default:
-            return .absent
+        FileResultCache.shared.value(for: url) {
+            guard let handle = try? FileHandle(forReadingFrom: url) else { return .absent }
+            defer { try? handle.close() }
+            let size = Int64((try? handle.seekToEnd()) ?? 0)
+            try? handle.seek(toOffset: UInt64(max(0, size - 2_000_000)))
+            guard let data = try? handle.readToEnd(),
+                  let text = String(data: data, encoding: .utf8) else { return .absent }
+            let started = text.range(of: "span_started name=\"streamFromAgentBackend\"", options: .backwards)?.lowerBound
+            let completed = text.range(of: "span_completed name=\"streamFromAgentBackend\"", options: .backwards)?.lowerBound
+            switch (started, completed) {
+            case let (s?, c?):
+                return s > c ? .open : .closed
+            case (.some, nil):
+                return .open
+            case (nil, .some):
+                return .closed
+            default:
+                return .absent
+            }
         }
     }
 

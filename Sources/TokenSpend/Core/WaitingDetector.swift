@@ -367,7 +367,7 @@ enum WaitingDetector {
 
         for (log, mtime) in CursorLogs.requestTraceLogs(newerThan: activeCutoff).prefix(3) {
             guard mtime < now.addingTimeInterval(-threshold) else { continue }
-            if tailHasOpenToolCall(log) {
+            if tailIndicatesStall(log) {
                 return .stalled
             }
         }
@@ -413,15 +413,38 @@ enum WaitingDetector {
         return String(rest[..<end])
     }
 
-    private static func tailHasOpenToolCall(_ url: URL) -> Bool {
+    // Shell-executor spans stay open for the whole lifetime of a terminal
+    // command. One still open means a command is running, not a stall.
+    private static let terminalSpanNames = [
+        "LazyTerminalExecutor.execute",
+        "LocalShellStreamExecutor.execute",
+        "ShellCoreExecutor.execute",
+        "ZshState.execute",
+    ]
+
+    private static func tailIndicatesStall(_ url: URL) -> Bool {
         FileResultCache.shared.value(for: url) {
             guard let handle = try? FileHandle(forReadingFrom: url) else { return false }
             defer { try? handle.close() }
             let size = Int64((try? handle.seekToEnd()) ?? 0)
-            let readStart = max(0, size - 16_384)
+            let readStart = max(0, size - 65_536)
             try? handle.seek(toOffset: UInt64(readStart))
             guard let data = try? handle.readToEnd(),
                   let text = String(data: data, encoding: .utf8) else { return false }
+
+            var openTerminalSpans: Set<String> = []
+            for line in text.split(separator: "\n") {
+                guard line.contains("span_"),
+                      terminalSpanNames.contains(where: { line.contains("name=\"\($0)\"") }),
+                      let sidRange = line.range(of: "spanId=") else { continue }
+                let sid = line[sidRange.upperBound...].prefix(while: { $0 != " " })
+                if line.contains("span_started") {
+                    openTerminalSpans.insert(String(sid))
+                } else if line.contains("span_completed") {
+                    openTerminalSpans.remove(String(sid))
+                }
+            }
+            if !openTerminalSpans.isEmpty { return false }
 
             let inProgressMarkers = ["AgentResponseAdapter.toolCallStarted", "processPartialToolCall"]
             let doneMarkers = ["AgentResponseAdapter.toolCallCompleted"]

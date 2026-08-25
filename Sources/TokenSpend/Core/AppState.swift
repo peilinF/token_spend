@@ -9,12 +9,14 @@ final class AppState: ObservableObject {
     @Published var period: Period {
         didSet {
             UserDefaults.standard.set(period.rawValue, forKey: "period")
+            lastSummaryVersion = -1
             recompute()
         }
     }
     @Published var mode: UsageMode {
         didSet {
             UserDefaults.standard.set(mode.rawValue, forKey: "mode")
+            lastSummaryVersion = -1
             recompute()
         }
     }
@@ -92,7 +94,9 @@ final class AppState: ObservableObject {
             Task { await AppState.shared.runReconcile() }
         }
         expiryTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { _ in
-            Task { await AppState.shared.recomputeActiveTools() }
+            MainActor.assumeIsolated {
+                AppState.shared.recomputeActiveTools()
+            }
         }
         activityWatcher.onActivity = { tool in
             Task { @MainActor in AppState.shared.markSeen(tool) }
@@ -145,16 +149,22 @@ final class AppState: ObservableObject {
     }
 
     func refreshLocal() async {
-        let store = self.store
-        try? await Task.detached(priority: .utility) {
-            try OpenCodeSource.refresh(store: store, overlapMS: 120_000)
-            try CodexSource.refresh(store: store)
-        }.value
-        recompute()
+        await refreshLocalSources(overlapMS: 120_000)
         lastUpdated = Date()
     }
 
+    private func refreshLocalSources(overlapMS: Int64) async {
+        let store = self.store
+        try? await Task.detached(priority: .utility) {
+            try OpenCodeSource.refresh(store: store, overlapMS: overlapMS)
+            try CodexSource.refresh(store: store)
+        }.value
+        recompute()
+    }
+
     func markSeen(_ tool: Tool) {
+        // Coalesce bursts: WAL writes can fire dozens of events per second.
+        if let last = lastSeenActivity[tool], Date().timeIntervalSince(last) < 0.3 { return }
         lastSeenActivity[tool] = Date()
         recomputeActiveTools()
     }
@@ -212,11 +222,7 @@ final class AppState: ObservableObject {
             }
         }
 
-        try? await Task.detached(priority: .utility) {
-            try OpenCodeSource.refresh(store: store, overlapMS: 15_000)
-            try CodexSource.refresh(store: store)
-        }.value
-        recompute()
+        await refreshLocalSources(overlapMS: 15_000)
         // No recordLiveSample / +xx/m. Rate UI was removed on purpose.
     }
 
@@ -277,8 +283,21 @@ final class AppState: ObservableObject {
         cursorNextAttempt = Date().addingTimeInterval(seconds)
     }
 
+    private var lastSummaryVersion = -1
+    private var lastSummaryDay = ""
+    private var lastRecomputeAt = Date.distantPast
+
     func recompute() {
         let now = Date()
+        let day = Fmt.day(now)
+        let version = store.dataVersion
+        // Skip the SQL + summary rebuild when usage data is unchanged; still
+        // refresh time-based bits (ring progress, day rollover) once a minute.
+        if version == lastSummaryVersion, day == lastSummaryDay,
+           now.timeIntervalSince(lastRecomputeAt) < 60, summary != nil { return }
+        lastSummaryVersion = version
+        lastSummaryDay = day
+        lastRecomputeAt = now
         let range = PeriodMath.range(of: period, now: now)
         let calendar = Calendar.current
 

@@ -5,6 +5,15 @@ final class UsageStore {
 
     private let db: SQLiteDatabase?
     private let ioLock = NSLock()
+    private var version = 0
+
+    // Bumped only by contrib writes; meta writes do not count, so poll loops
+    // can skip recomputing summaries when usage data is unchanged.
+    var dataVersion: Int {
+        ioLock.lock()
+        defer { ioLock.unlock() }
+        return version
+    }
 
     private static var dir: URL {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -54,6 +63,7 @@ final class UsageStore {
             binds: [.text(source.rawValue), .text(key), .text(day),
                     .int(amount.input), .int(amount.output), .int(amount.cacheRead), .int(amount.cacheWrite), .double(amount.cost)]
         ) { _ in }
+        version += 1
     }
 
     func deleteAll(source: Tool) {
@@ -61,6 +71,7 @@ final class UsageStore {
         ioLock.lock()
         defer { ioLock.unlock() }
         try? db.query("DELETE FROM contrib WHERE source=?", binds: [.text(source.rawValue)]) { _ in }
+        version += 1
     }
 
     func deleteSourceKeys(source: Tool, keyPrefix: String) {
@@ -68,6 +79,7 @@ final class UsageStore {
         ioLock.lock()
         defer { ioLock.unlock() }
         try? db.query("DELETE FROM contrib WHERE source=? AND key LIKE ?", binds: [.text(source.rawValue), .text(keyPrefix + "%")]) { _ in }
+        version += 1
     }
 
     func keysForSource(source: Tool) -> [String] {
@@ -97,6 +109,7 @@ final class UsageStore {
             binds: [.text(source.rawValue)]
         ) { _ in }
         try? db.execute("DELETE FROM reconcile_keys")
+        version += 1
     }
 
     func dailyTotals(sinceDay: String) -> [Tool: [String: UsageAmount]] {

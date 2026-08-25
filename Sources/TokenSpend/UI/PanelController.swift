@@ -7,13 +7,15 @@ final class PanelWindow: NSPanel {
 }
 
 @MainActor
-final class PanelController {
+final class PanelController: ObservableObject {
     static let shared = PanelController()
 
     private(set) var circlePanel: PanelWindow!
     private(set) var detailPanel: PanelWindow!
     private var monitors: [AnyObject] = []
     private var moveObserver: NSObjectProtocol?
+    private var occlusionObserver: NSObjectProtocol?
+    @Published private(set) var circleOccluded = false
 
     var state: AppState { AppState.shared }
 
@@ -22,6 +24,13 @@ final class PanelController {
         setupDetail()
         installClickMonitors()
         observeMove()
+        occlusionObserver = NotificationCenter.default.addObserver(
+            forName: NSWindow.didChangeOcclusionStateNotification, object: circlePanel, queue: .main
+        ) { [weak self] note in
+            guard let self, let window = note.object as? NSWindow else { return }
+            let occluded = !window.occlusionState.contains(.visible)
+            Task { @MainActor in self.circleOccluded = occluded }
+        }
     }
 
     private func makePanel(_ content: NSView, size: NSSize) -> PanelWindow {
@@ -43,7 +52,7 @@ final class PanelController {
     }
 
     private func setupCircle() {
-        let view = NSHostingView(rootView: CircleView(state: state))
+        let view = NSHostingView(rootView: CircleView(state: state, panel: self))
         view.setFrameSize(NSSize(width: 136, height: 136))
         circlePanel = makePanel(view, size: NSSize(width: 136, height: 136))
         if let saved = loadOrigin(key: "circle_origin") {
@@ -76,6 +85,7 @@ final class PanelController {
     func showCircle() {
         ensureOnScreen()
         circlePanel.orderFrontRegardless()
+        circleOccluded = false
         UserDefaults.standard.set(true, forKey: "show_circle")
     }
 
@@ -96,6 +106,7 @@ final class PanelController {
 
     func hideCircle() {
         circlePanel.orderOut(nil)
+        circleOccluded = true
         hideDetail()
         UserDefaults.standard.set(false, forKey: "show_circle")
     }
