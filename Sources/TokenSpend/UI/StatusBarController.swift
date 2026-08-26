@@ -11,6 +11,7 @@ final class StatusBarController {
 
     private var statusItem: NSStatusItem?
     private var cancellable: AnyCancellable?
+    private var iconCancellable: AnyCancellable?
 
     func install() {
         guard statusItem == nil else { return }
@@ -24,6 +25,12 @@ final class StatusBarController {
             .sink { [weak self] _ in
                 self?.refreshIcon()
                 self?.rebuild()
+            }
+        // Tool colors can change from the settings panel; keep the dots in sync.
+        iconCancellable = AppState.shared.objectWillChange
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                self?.refreshIcon()
             }
     }
 
@@ -123,6 +130,10 @@ final class StatusBarController {
         showItem.state = PanelController.shared.isCircleVisible ? .on : .off
         menu.addItem(showItem)
 
+        let settingsItem = NSMenuItem(title: "偏好设置…", action: #selector(toggleSettingsPanel(_:)), keyEquivalent: ",")
+        settingsItem.target = self
+        menu.addItem(settingsItem)
+
         let loginItem = NSMenuItem(title: "开机自启", action: #selector(toggleLogin(_:)), keyEquivalent: "")
         loginItem.target = self
         loginItem.state = LaunchAtLogin.isEnabled ? .on : .off
@@ -180,6 +191,10 @@ final class StatusBarController {
             PanelController.shared.showCircle()
         }
         rebuild()
+    }
+
+    @objc private func toggleSettingsPanel(_ sender: NSMenuItem) {
+        PanelController.shared.toggleSettings()
     }
 
     @objc private func toggleLogin(_ sender: NSMenuItem) {

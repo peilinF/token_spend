@@ -12,6 +12,7 @@ final class PanelController: ObservableObject {
 
     private(set) var circlePanel: PanelWindow!
     private(set) var detailPanel: PanelWindow!
+    private(set) var settingsPanel: PanelWindow!
     private var monitors: [AnyObject] = []
     private var moveObserver: NSObjectProtocol?
     private var occlusionObserver: NSObjectProtocol?
@@ -22,6 +23,7 @@ final class PanelController: ObservableObject {
     init() {
         setupCircle()
         setupDetail()
+        setupSettings()
         installClickMonitors()
         observeMove()
         occlusionObserver = NotificationCenter.default.addObserver(
@@ -33,10 +35,14 @@ final class PanelController: ObservableObject {
         }
     }
 
-    private func makePanel(_ content: NSView, size: NSSize) -> PanelWindow {
+    private func makePanel(_ content: NSView, size: NSSize, activating: Bool = false) -> PanelWindow {
+        var mask: NSWindow.StyleMask = [.borderless]
+        // The settings panel must activate the app, otherwise the system color
+        // picker refuses to pop up from its ColorPicker swatches.
+        if !activating { mask.insert(.nonactivatingPanel) }
         let panel = PanelWindow(
             contentRect: NSRect(origin: .zero, size: size),
-            styleMask: [.borderless, .nonactivatingPanel],
+            styleMask: mask,
             backing: .buffered, defer: false
         )
         panel.isOpaque = false
@@ -104,6 +110,44 @@ final class PanelController: ObservableObject {
         detailPanel = makePanel(view, size: size)
     }
 
+    private func setupSettings() {
+        let view = NSHostingView(rootView: SettingsView(state: state))
+        let size = view.fittingSize
+        view.setFrameSize(size)
+        settingsPanel = makePanel(view, size: size, activating: true)
+    }
+
+    func toggleSettings() {
+        if settingsPanel.isVisible {
+            hideSettings()
+        } else {
+            positionSettings()
+            settingsPanel.orderFrontRegardless()
+            NSApp.activate(ignoringOtherApps: true)
+        }
+    }
+
+    func hideSettings() {
+        settingsPanel.orderOut(nil)
+    }
+
+    private func positionSettings() {
+        let circle = circlePanel.frame
+        let size = settingsPanel.frame.size
+        guard let screen = circlePanel.screen ?? NSScreen.main else { return }
+        let visible = screen.visibleFrame
+
+        var x = circle.minX - size.width - 10
+        if x < visible.minX + 4 {
+            x = circle.maxX + 10
+        }
+        x = max(visible.minX + 4, min(x, visible.maxX - size.width - 4))
+
+        var y = circle.midY + size.height / 2
+        y = max(visible.minY + 4, min(y, visible.maxY - 4))
+        settingsPanel.setFrameOrigin(NSPoint(x: x, y: y))
+    }
+
     func hideCircle() {
         circlePanel.orderOut(nil)
         circleOccluded = true
@@ -150,8 +194,12 @@ final class PanelController: ObservableObject {
             let location = NSEvent.mouseLocation
             let inCircle = self.circlePanel.isVisible && self.circlePanel.frame.contains(location)
             let inDetail = self.detailPanel.isVisible && self.detailPanel.frame.contains(location)
-            if !inCircle && !inDetail {
+            let inSettings = self.settingsPanel.isVisible && self.settingsPanel.frame.contains(location)
+            let colorPanel = NSColorPanel.shared
+            let inColorPanel = colorPanel.isVisible && colorPanel.frame.contains(location)
+            if !inCircle && !inDetail && !inSettings && !inColorPanel {
                 self.hideDetail()
+                self.hideSettings()
             }
         }
         monitors.append(NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown], handler: handler) as AnyObject)

@@ -1,6 +1,7 @@
 import AppKit
 import Foundation
 import Combine
+import SwiftUI
 
 @MainActor
 final class AppState: ObservableObject {
@@ -38,6 +39,30 @@ final class AppState: ObservableObject {
     var cursorActiveInterval: TimeInterval {
         get { UserDefaults.standard.object(forKey: "cursor_active_interval") as? TimeInterval ?? 8 }
         set { UserDefaults.standard.set(newValue, forKey: "cursor_active_interval") }
+    }
+
+    var animationFPS: Int {
+        get { UserDefaults.standard.object(forKey: "animation_fps") as? Int ?? 30 }
+        set {
+            UserDefaults.standard.set(newValue, forKey: "animation_fps")
+            objectWillChange.send()
+        }
+    }
+
+    func toolColor(_ tool: Tool) -> Color { tool.color }
+
+    func setToolColor(_ tool: Tool, _ color: Color) {
+        guard let ns = NSColor(color).usingColorSpace(.sRGB) else { return }
+        let raw = String(format: "%.3f,%.3f,%.3f", ns.redComponent, ns.greenComponent, ns.blueComponent)
+        UserDefaults.standard.set(raw, forKey: tool.colorKey)
+        objectWillChange.send()
+    }
+
+    func resetToolColors() {
+        for tool in Tool.allCases {
+            UserDefaults.standard.removeObject(forKey: tool.colorKey)
+        }
+        objectWillChange.send()
     }
 
     private let store = UsageStore.shared

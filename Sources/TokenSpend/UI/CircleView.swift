@@ -1,12 +1,22 @@
 import SwiftUI
 
 extension Tool {
+    static let defaultColors: [Tool: Color] = [
+        .opencode: Color(red: 0.20, green: 0.78, blue: 0.40),
+        .codex: Color(red: 1.00, green: 0.30, blue: 0.55),
+        .cursor: Color(red: 0.72, green: 0.42, blue: 0.98),
+    ]
+
+    var colorKey: String { "color_\(rawValue)" }
+
     var color: Color {
-        switch self {
-        case .opencode: return Color(red: 0.20, green: 0.78, blue: 0.40)
-        case .codex: return Color(red: 1.00, green: 0.30, blue: 0.55)
-        case .cursor: return Color(red: 0.72, green: 0.42, blue: 0.98)
+        if let raw = UserDefaults.standard.string(forKey: colorKey) {
+            let parts = raw.split(separator: ",").compactMap { Double($0) }
+            if parts.count == 3 {
+                return Color(red: parts[0], green: parts[1], blue: parts[2])
+            }
         }
+        return Self.defaultColors[self] ?? .accentColor
     }
 }
 
@@ -32,8 +42,12 @@ struct CircleView: View {
 
     var body: some View {
         ZStack {
-            ActivityArcsView(tools: state.activeTools.sorted(by: { $0.rawValue < $1.rawValue }), paused: panel.circleOccluded)
-                .allowsHitTesting(false)
+            ActivityArcsView(
+                tools: state.activeTools.sorted(by: { $0.rawValue < $1.rawValue }),
+                paused: panel.circleOccluded,
+                fps: state.animationFPS
+            )
+            .allowsHitTesting(false)
 
             ZStack {
                 Circle()
@@ -126,10 +140,11 @@ struct CircleView: View {
 struct ActivityArcsView: View {
     let tools: [Tool]
     let paused: Bool
+    let fps: Int
     @State private var glowPulse = false
 
     var body: some View {
-        TimelineView(.animation(minimumInterval: 1.0 / 30, paused: paused || tools.isEmpty)) { timeline in
+        TimelineView(.animation(minimumInterval: 1.0 / Double(max(1, fps)), paused: paused || tools.isEmpty)) { timeline in
             let t = timeline.date.timeIntervalSinceReferenceDate
             let spin = (t * 115).truncatingRemainder(dividingBy: 360)
             let wobble = sin(t * 3.2) * 0.7 + 0.3
@@ -297,6 +312,10 @@ struct ContextMenus {
             get: { LaunchAtLogin.isEnabled },
             set: { LaunchAtLogin.isEnabled = $0 }
         ))
+        Divider()
+        Button("偏好设置…") {
+            PanelController.shared.toggleSettings()
+        }
         Divider()
         Button("退出") { NSApp.terminate(nil) }
     }
