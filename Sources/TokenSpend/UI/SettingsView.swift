@@ -17,6 +17,16 @@ struct SettingsView: View {
             }
             .pickerStyle(.menu)
 
+            Picker("额度显示", selection: Binding(
+                get: { state.quotaDisplayMode },
+                set: { state.quotaDisplayMode = $0 }
+            )) {
+                Text("常驻显示").tag(QuotaDisplayMode.always)
+                Text("悬浮时显示").tag(QuotaDisplayMode.hover)
+                Text("隐藏").tag(QuotaDisplayMode.hidden)
+            }
+            .pickerStyle(.menu)
+
             Divider()
 
             ForEach(Tool.allCases, id: \.self) { tool in

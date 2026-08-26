@@ -29,6 +29,25 @@ if arguments.contains("--print-waiting") {
     exit(0)
 }
 
+if arguments.contains("--print-quota") {
+    let store = UsageStore.shared
+    if let quota = CodexQuota.decode(fromJSON: store.meta("codex_rate_limits")) {
+        var windows: [String] = []
+        if let w = quota.primary { windows.append("5h剩\(Int(w.leftPercent))%(window \(w.windowMinutes ?? 0)min)") }
+        if let w = quota.secondary { windows.append("周剩\(Int(w.leftPercent))%") }
+        print("codex:", windows.joined(separator: " | "), quota.planType.map { "[\($0)]" } ?? "")
+    } else {
+        print("codex: none")
+    }
+    if let quota = CursorQuota.decode(fromJSON: store.meta("cursor_quota")) {
+        func pct(_ v: Double?) -> String { v.map { String(format: "%.0f%%", $0) } ?? "-" }
+        print("cursor: total used \(pct(quota.totalPercentUsed)), auto \(pct(quota.autoPercentUsed)), api \(pct(quota.apiPercentUsed)), cycle \(quota.cycleStart.map(Fmt.shortDate) ?? "?")~\(quota.cycleEnd.map(Fmt.shortDate) ?? "?"), used \(quota.used ?? -1)/\(quota.limit ?? -1), bonus \(quota.bonus ?? 0)")
+    } else {
+        print("cursor: none")
+    }
+    exit(0)
+}
+
 if arguments.contains("--print-live") {    var done = false
     Task { @MainActor in
         let state = AppState.shared

@@ -120,6 +120,10 @@ enum CursorSource {
         }
         do {
             try await syncEvents(cookie: cookie, store: store)
+            // Quota summary is best-effort: its failure must not fail the sync.
+            if let summary = try? await fetchUsageSummary(cookie: cookie) {
+                persistQuotaSummary(summary, store: store)
+            }
             store.setMeta("cursor_last_sync", String(Date().timeIntervalSince1970))
             let state = CursorAuthState.ok(cookieExpiry: expiry)
             lastAuthState = state
@@ -129,6 +133,26 @@ enum CursorSource {
             lastAuthState = .needsRelogin
             throw CursorAPIError.unauthorized
         }
+    }
+
+    // Reverse-engineered dashboard endpoint backing cursor.com/dashboard;
+    // carries the monthly pools (included vs API-key models). Best effort.
+    private static func fetchUsageSummary(cookie: String) async throws -> [String: Any]? {
+        guard let url = URL(string: "https://cursor.com/api/usage-summary") else { return nil }
+        var req = URLRequest(url: url, timeoutInterval: 20)
+        req.setValue("WorkosCursorSessionToken=\(cookie)", forHTTPHeaderField: "Cookie")
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        if let http = resp as? HTTPURLResponse {
+            if http.statusCode == 401 || http.statusCode == 403 { throw CursorAPIError.unauthorized }
+            guard (200..<300).contains(http.statusCode) else { return nil }
+        }
+        return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+    }
+
+    private static func persistQuotaSummary(_ json: [String: Any], store: UsageStore) {
+        guard let data = try? JSONSerialization.data(withJSONObject: json),
+              let raw = String(data: data, encoding: .utf8), !raw.isEmpty else { return }
+        store.setMeta("cursor_quota", raw)
     }
 
     static var lastAuthState: CursorAuthState = .unknown

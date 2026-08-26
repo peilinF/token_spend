@@ -192,6 +192,79 @@ struct DetailView: View {
                 }
             }
             .frame(height: 3)
+
+            if item.tool == .codex, let quota = state.codexQuota {
+                codexQuotaBlock(quota)
+            }
+            if item.tool == .cursor, let quota = state.cursorQuota {
+                cursorQuotaBlock(quota)
+            }
+        }
+    }
+
+    private func codexQuotaBlock(_ quota: CodexQuota) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            if let window = quota.primary {
+                QuotaBar(
+                    label: window.shortLabel, valueText: "剩 \(Int(window.leftPercent))%",
+                    fraction: window.leftPercent / 100, color: .codex,
+                    detailText: window.resetText, barWidth: 110
+                )
+            }
+            if let window = quota.secondary {
+                QuotaBar(
+                    label: window.shortLabel, valueText: "剩 \(Int(window.leftPercent))%",
+                    fraction: window.leftPercent / 100, color: .codex,
+                    detailText: window.resetText, barWidth: 110
+                )
+            }
+        }
+        .padding(.leading, 13)
+    }
+
+    private func cursorQuotaBlock(_ quota: CursorQuota) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 6) {
+                Text("月度")
+                    .font(.system(size: 9, weight: .bold))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 18, alignment: .leading)
+                ZStack(alignment: .leading) {
+                    Capsule().fill(Color.primary.opacity(0.06))
+                    Capsule()
+                        .fill(Color.cursor.opacity(0.85))
+                        .frame(width: max(2, 110 * CGFloat(min(1, (quota.totalPercentUsed ?? 0) / 100))))
+                }
+                .frame(width: 110, height: 4)
+                Text("已用 \(Int(quota.totalPercentUsed ?? 0))%")
+                    .font(.system(size: 9, weight: .semibold))
+                    .monospacedDigit()
+                Spacer(minLength: 4)
+                if let end = quota.cycleEnd {
+                    Text("至 " + Fmt.shortDate(end))
+                        .font(.system(size: 8))
+                        .foregroundStyle(.tertiary)
+                }
+            }
+            HStack(spacing: 6) {
+                poolLine("自家模型池", percent: quota.autoPercentUsed)
+                poolLine("三方模型池", percent: quota.apiPercentUsed)
+                if let bonus = quota.bonus, bonus > 0 {
+                    Text("+bonus").font(.system(size: 8)).foregroundStyle(.tertiary)
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(.leading, 24)
+        }
+        .padding(.leading, 13)
+    }
+
+    @ViewBuilder
+    private func poolLine(_ name: String, percent: Double?) -> some View {
+        if let percent {
+            Text("\(name) 已用 \(Int(percent))%")
+                .font(.system(size: 8))
+                .foregroundStyle(.secondary)
         }
     }
 

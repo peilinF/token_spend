@@ -12,6 +12,7 @@ final class StatusBarController {
     private var statusItem: NSStatusItem?
     private var cancellable: AnyCancellable?
     private var iconCancellable: AnyCancellable?
+    private var quotaCancellable: AnyCancellable?
 
     func install() {
         guard statusItem == nil else { return }
@@ -32,6 +33,29 @@ final class StatusBarController {
             .sink { [weak self] _ in
                 self?.refreshIcon()
             }
+        quotaCancellable = Publishers.CombineLatest(
+            AppState.shared.$codexQuota, AppState.shared.$cursorQuota
+        )
+        .dropFirst()
+        .receive(on: DispatchQueue.main)
+        .sink { [weak self] _ in
+            self?.rebuild()
+        }
+    }
+
+    private func quotaSummaryLine() -> String? {
+        let state = AppState.shared
+        var parts: [String] = []
+        if let quota = state.codexQuota {
+            var windows: [String] = []
+            if let primary = quota.primary { windows.append("5h剩\(Int(primary.leftPercent))%") }
+            if let secondary = quota.secondary { windows.append("周剩\(Int(secondary.leftPercent))%") }
+            if !windows.isEmpty { parts.append("codex " + windows.joined(separator: "/")) }
+        }
+        if let quota = state.cursorQuota, let total = quota.totalPercentUsed {
+            parts.append("cursor 月度已用\(Int(total))%")
+        }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
     }
 
     private func refreshIcon() {
@@ -63,6 +87,13 @@ final class StatusBarController {
     private func buildMenu() -> NSMenu {
         let state = AppState.shared
         let menu = NSMenu()
+
+        if let quotaLine = quotaSummaryLine() {
+            let item = NSMenuItem(title: "额度：\(quotaLine)", action: nil, keyEquivalent: "")
+            item.isEnabled = false
+            menu.addItem(item)
+            menu.addItem(.separator())
+        }
 
         let waiting = state.waiting
         if !waiting.isEmpty {

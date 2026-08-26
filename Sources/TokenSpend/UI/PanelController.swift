@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import SwiftUI
 
 final class PanelWindow: NSPanel {
@@ -13,9 +14,12 @@ final class PanelController: ObservableObject {
     private(set) var circlePanel: PanelWindow!
     private(set) var detailPanel: PanelWindow!
     private(set) var settingsPanel: PanelWindow!
+    private(set) var quotaPanel: PanelWindow!
+    private var quotaHostingView: NSHostingView<QuotaStripView>!
     private var monitors: [AnyObject] = []
     private var moveObserver: NSObjectProtocol?
     private var occlusionObserver: NSObjectProtocol?
+    private var fitCancellable: AnyCancellable?
     @Published private(set) var circleOccluded = false
 
     var state: AppState { AppState.shared }
@@ -24,6 +28,7 @@ final class PanelController: ObservableObject {
         setupCircle()
         setupDetail()
         setupSettings()
+        setupQuota()
         installClickMonitors()
         observeMove()
         occlusionObserver = NotificationCenter.default.addObserver(
@@ -33,6 +38,9 @@ final class PanelController: ObservableObject {
             let occluded = !window.occlusionState.contains(.visible)
             Task { @MainActor in self.circleOccluded = occluded }
         }
+        fitCancellable = AppState.shared.objectWillChange
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.refitCircle() }
     }
 
     private func makePanel(_ content: NSView, size: NSSize, activating: Bool = false) -> PanelWindow {
@@ -59,8 +67,9 @@ final class PanelController: ObservableObject {
 
     private func setupCircle() {
         let view = NSHostingView(rootView: CircleView(state: state, panel: self))
-        view.setFrameSize(NSSize(width: 136, height: 136))
-        circlePanel = makePanel(view, size: NSSize(width: 136, height: 136))
+        let size = view.fittingSize
+        view.setFrameSize(size)
+        circlePanel = makePanel(view, size: size)
         if let saved = loadOrigin(key: "circle_origin") {
             circlePanel.setFrameTopLeftPoint(saved)
             ensureOnScreen()
@@ -117,6 +126,57 @@ final class PanelController: ObservableObject {
         settingsPanel = makePanel(view, size: size, activating: true)
     }
 
+    private func setupQuota() {
+        let view = NSHostingView(rootView: QuotaStripView(state: state))
+        let size = view.fittingSize
+        view.setFrameSize(size)
+        quotaHostingView = view
+        let panel = makePanel(view, size: size)
+        panel.ignoresMouseEvents = true
+        quotaPanel = panel
+    }
+
+    // Hover mode target: a click-through readout under the circle. It never
+    // intercepts input, so it cannot get in the way of apps underneath.
+    func setQuotaHover(_ hovering: Bool) {
+        guard AppState.shared.quotaDisplayMode == .hover else { return }
+        if hovering {
+            positionQuota()
+            quotaPanel.orderFrontRegardless()
+        } else {
+            quotaPanel.orderOut(nil)
+        }
+    }
+
+    private func positionQuota() {
+        let size = quotaHostingView.fittingSize
+        quotaHostingView.setFrameSize(size)
+        quotaPanel.setContentSize(size)
+        let circle = circlePanel.frame
+        guard let screen = circlePanel.screen ?? NSScreen.main else { return }
+        let visible = screen.visibleFrame
+
+        var x = circle.midX - size.width / 2
+        x = max(visible.minX + 4, min(x, visible.maxX - size.width - 4))
+
+        var y = circle.minY - size.height - 6
+        y = max(visible.minY + 4, min(y, visible.maxY - size.height - 4))
+        quotaPanel.setFrameOrigin(NSPoint(x: x, y: y))
+    }
+
+    private func refitCircle() {
+        if AppState.shared.quotaDisplayMode != .hover {
+            quotaPanel.orderOut(nil)
+        }
+        guard let view = circlePanel.contentView as? NSHostingView<CircleView> else { return }
+        let size = view.fittingSize
+        guard abs(size.height - circlePanel.frame.height) > 0.5
+                || abs(size.width - circlePanel.frame.width) > 0.5 else { return }
+        let topLeft = NSPoint(x: circlePanel.frame.minX, y: circlePanel.frame.maxY)
+        circlePanel.setContentSize(size)
+        circlePanel.setFrameTopLeftPoint(topLeft)
+    }
+
     func toggleSettings() {
         if settingsPanel.isVisible {
             hideSettings()
@@ -152,6 +212,7 @@ final class PanelController: ObservableObject {
         circlePanel.orderOut(nil)
         circleOccluded = true
         hideDetail()
+        quotaPanel?.orderOut(nil)
         UserDefaults.standard.set(false, forKey: "show_circle")
     }
 

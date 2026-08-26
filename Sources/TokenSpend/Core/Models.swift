@@ -151,3 +151,118 @@ struct PeriodSummary {
         perTool.reduce(.zero) { $0 + $1.amount }
     }
 }
+
+enum QuotaDisplayMode: String {
+    case always
+    case hover
+    case hidden
+}
+
+struct QuotaWindow: Equatable {
+    var usedPercent: Double
+    var windowMinutes: Int?
+    var resetsAt: Date?
+
+    var leftPercent: Double {
+        min(100, max(0, 100 - usedPercent))
+    }
+
+    var shortLabel: String {
+        guard let minutes = windowMinutes, minutes > 0 else { return "5h" }
+        if minutes < 1440 { return "\(minutes / 60)h" }
+        return "\(minutes / 1440)d"
+    }
+
+    var resetText: String {
+        guard let resetsAt else { return "" }
+        if (windowMinutes ?? 0) < 1440 {
+            return Fmt.time(resetsAt) + " 重置"
+        }
+        return Fmt.shortDate(resetsAt) + " 重置"
+    }
+}
+
+struct CodexQuota: Equatable {
+    var primary: QuotaWindow?
+    var secondary: QuotaWindow?
+    var planType: String?
+    var creditsBalance: String?
+
+    // Snapshots arrive per limit family ("codex", "premium", model-specific
+    // ones). Prefer the main plan family, then any family with real windows.
+    static func decode(fromJSON raw: String?) -> CodexQuota? {
+        guard let raw, let data = raw.data(using: .utf8),
+              let o = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return nil }
+        let snapshots = o.values.compactMap { $0 as? [String: Any] }
+        let ordered = snapshots.sorted { rank($0) < rank($1) }
+        for snapshot in ordered {
+            if let quota = decodeSnapshot(snapshot) { return quota }
+        }
+        return nil
+    }
+
+    private static func rank(_ snapshot: [String: Any]) -> Int {
+        (snapshot["limit_id"] as? String)?.lowercased() == "codex" ? 0 : 1
+    }
+
+    private static func decodeSnapshot(_ o: [String: Any]) -> CodexQuota? {
+        func window(_ value: Any?) -> QuotaWindow? {
+            guard let d = value as? [String: Any],
+                  let used = (d["used_percent"] as? NSNumber)?.doubleValue else { return nil }
+            return QuotaWindow(
+                usedPercent: used,
+                windowMinutes: (d["window_minutes"] as? NSNumber)?.intValue,
+                resetsAt: (d["resets_at"] as? NSNumber).map { Date(timeIntervalSince1970: $0.doubleValue) }
+            )
+        }
+        let quota = CodexQuota(
+            primary: window(o["primary"]),
+            secondary: window(o["secondary"]),
+            planType: o["plan_type"] as? String,
+            creditsBalance: (o["credits"] as? [String: Any])?["balance"] as? String
+        )
+        return quota.primary != nil || quota.secondary != nil ? quota : nil
+    }
+}
+
+struct CursorQuota: Equatable {
+    var cycleStart: Date?
+    var cycleEnd: Date?
+    var totalPercentUsed: Double?
+    var autoPercentUsed: Double?
+    var apiPercentUsed: Double?
+    var used: Int64?
+    var limit: Int64?
+    var bonus: Int64?
+
+    static func decode(fromJSON raw: String?) -> CursorQuota? {
+        guard let raw, let data = raw.data(using: .utf8),
+              let o = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return nil }
+        guard let plan = (o["individualUsage"] as? [String: Any])?["plan"] as? [String: Any] else { return nil }
+        let breakdown = plan["breakdown"] as? [String: Any]
+
+        func pct(_ key: String) -> Double? {
+            (plan[key] as? NSNumber)?.doubleValue
+        }
+        func date(_ key: String) -> Date? {
+            (o[key] as? String).flatMap { Formatters.isoFractional.date(from: $0) }
+        }
+        var quota = CursorQuota(
+            cycleStart: date("billingCycleStart"),
+            cycleEnd: date("billingCycleEnd"),
+            totalPercentUsed: pct("totalPercentUsed"),
+            autoPercentUsed: pct("autoPercentUsed"),
+            apiPercentUsed: pct("apiPercentUsed"),
+            used: (plan["used"] as? NSNumber)?.int64Value,
+            limit: (plan["limit"] as? NSNumber)?.int64Value,
+            bonus: (breakdown?["bonus"] as? NSNumber)?.int64Value
+        )
+        if quota.totalPercentUsed == nil, quota.autoPercentUsed == nil, quota.apiPercentUsed == nil {
+            return nil
+        }
+        if quota.totalPercentUsed == nil, let a = quota.autoPercentUsed ?? quota.apiPercentUsed {
+            quota.totalPercentUsed = a
+        }
+        return quota
+    }
+}

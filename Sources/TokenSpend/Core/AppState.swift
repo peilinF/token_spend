@@ -29,6 +29,8 @@ final class AppState: ObservableObject {
     @Published private(set) var activeTools: Set<Tool> = []
     @Published private(set) var activeSince: [Tool: Date] = [:]
     @Published private(set) var waiting: [Tool: WaitingInfo] = [:]
+    @Published private(set) var codexQuota: CodexQuota?
+    @Published private(set) var cursorQuota: CursorQuota?
     @Published var isDetailVisible = false
 
     var waitThreshold: TimeInterval {
@@ -65,6 +67,32 @@ final class AppState: ObservableObject {
         objectWillChange.send()
     }
 
+    var quotaDisplayMode: QuotaDisplayMode {
+        get { QuotaDisplayMode(rawValue: UserDefaults.standard.string(forKey: "quota_display") ?? "") ?? .always }
+        set {
+            UserDefaults.standard.set(newValue.rawValue, forKey: "quota_display")
+            objectWillChange.send()
+        }
+    }
+
+    private var lastCodexQuotaRaw: String?
+    private var lastCursorQuotaRaw: String?
+
+    private func refreshQuotas() {
+        let codexRaw = store.meta("codex_rate_limits")
+        if codexRaw != lastCodexQuotaRaw {
+            lastCodexQuotaRaw = codexRaw
+            let quota = CodexQuota.decode(fromJSON: codexRaw)
+            if quota != codexQuota { codexQuota = quota }
+        }
+        let cursorRaw = store.meta("cursor_quota")
+        if cursorRaw != lastCursorQuotaRaw {
+            lastCursorQuotaRaw = cursorRaw
+            let quota = CursorQuota.decode(fromJSON: cursorRaw)
+            if quota != cursorQuota { cursorQuota = quota }
+        }
+    }
+
     private let store = UsageStore.shared
     private let waitMonitor = WaitingMonitor()
     private let activityWatcher = ActivityWatcher()
@@ -94,6 +122,7 @@ final class AppState: ObservableObject {
         if let raw = store.meta("cursor_last_sync"), let ts = Double(raw) {
             cursorLastSync = Date(timeIntervalSince1970: ts)
         }
+        refreshQuotas()
         recompute()
     }
 
@@ -185,6 +214,7 @@ final class AppState: ObservableObject {
             try CodexSource.refresh(store: store)
         }.value
         recompute()
+        refreshQuotas()
     }
 
     func markSeen(_ tool: Tool) {
@@ -267,6 +297,7 @@ final class AppState: ObservableObject {
             cursorLastSync = Date()
             cursorFailures = 0
             cursorNextAttempt = .distantPast
+            refreshQuotas()
         } catch KeychainError.denied {
             cursorAuth = .keychainDenied
             applyCursorBackoff(seconds: 1800)

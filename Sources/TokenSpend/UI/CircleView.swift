@@ -20,6 +20,12 @@ extension Tool {
     }
 }
 
+extension Color {
+    static var codex: Color { Tool.codex.color }
+    static var cursor: Color { Tool.cursor.color }
+    static var opencode: Color { Tool.opencode.color }
+}
+
 struct CircleView: View {
     @ObservedObject var state: AppState
     @ObservedObject var panel: PanelController
@@ -41,87 +47,106 @@ struct CircleView: View {
     }
 
     var body: some View {
-        ZStack {
-            ActivityArcsView(
-                tools: state.activeTools.sorted(by: { $0.rawValue < $1.rawValue }),
-                paused: panel.circleOccluded,
-                fps: state.animationFPS
-            )
-            .allowsHitTesting(false)
-
+        VStack(spacing: 6) {
             ZStack {
-                Circle()
-                    .fill(.ultraThinMaterial)
-                Circle()
-                    .stroke(Color.primary.opacity(0.12), lineWidth: 1)
+                ActivityArcsView(
+                    tools: state.activeTools.sorted(by: { $0.rawValue < $1.rawValue }),
+                    paused: panel.circleOccluded,
+                    fps: state.animationFPS
+                )
+                .allowsHitTesting(false)
 
-                Circle()
-                    .trim(from: 0, to: state.summary?.progress ?? 0)
-                    .stroke(
-                        ringStyle,
-                        style: StrokeStyle(lineWidth: 3, lineCap: .round)
-                    )
-                    .rotationEffect(.degrees(-90))
-                    .padding(7)
-                    .opacity(blink ? 0.35 : 1)
-                    .animation(
-                        isWaiting
-                            ? .easeInOut(duration: 0.9).repeatForever(autoreverses: true)
-                            : .default,
-                        value: blink
-                    )
+                ZStack {
+                    Circle()
+                        .fill(.ultraThinMaterial)
+                    Circle()
+                        .stroke(Color.primary.opacity(0.12), lineWidth: 1)
 
-                VStack(spacing: 1) {
-                    Text(Fmt.tokens(total))
-                        .font(.system(size: 16, weight: .bold, design: .rounded))
-                        .monospacedDigit()
-                        .lineLimit(1)
-                        .minimumScaleFactor(0.6)
-                        .padding(.horizontal, 10)
-                    if isWaiting {
-                        if sortedWaitingTools.count == 1, let tool = sortedWaitingTools.first {
-                            VStack(spacing: 1) {
-                                HStack(spacing: 3) {
-                                    Circle()
-                                        .fill(tool.color)
-                                        .frame(width: 4.5, height: 4.5)
-                                        .modifier(PulseEffect())
-                                    Text(tool.displayName)
-                                        .font(.system(size: 9, weight: .bold))
-                                        .foregroundColor(tool.color)
-                                }
-                                Text(state.waiting[tool]?.kind == .question ? "等你回答" : "等你确认")
-                                    .font(.system(size: 8, weight: .bold))
-                                    .foregroundColor(.orange)
-                            }
+                    Circle()
+                        .trim(from: 0, to: state.summary?.progress ?? 0)
+                        .stroke(
+                            ringStyle,
+                            style: StrokeStyle(lineWidth: 3, lineCap: .round)
+                        )
+                        .rotationEffect(.degrees(-90))
+                        .padding(7)
+                        .opacity(blink ? 0.35 : 1)
+                        .animation(
+                            isWaiting
+                                ? .easeInOut(duration: 0.9).repeatForever(autoreverses: true)
+                                : .default,
+                            value: blink
+                        )
+
+                    VStack(spacing: 1) {
+                        Text(Fmt.tokens(total))
+                            .font(.system(size: 16, weight: .bold, design: .rounded))
+                            .monospacedDigit()
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.6)
+                            .padding(.horizontal, 10)
+                        if isWaiting {
+                            waitingCaption
                         } else {
-                            VStack(spacing: 1) {
-                                Text("⏳ \(state.waiting.count) 个在等你")
-                                    .font(.system(size: 9, weight: .bold))
-                                    .foregroundColor(.orange)
-                                waitingNamesText
-                                    .font(.system(size: 8, weight: .bold))
-                                    .lineLimit(1)
-                                    .minimumScaleFactor(0.6)
-                                    .padding(.horizontal, 10)
-                            }
+                            Text(state.period.displayName)
+                                .font(.system(size: 9, weight: .medium))
+                                .foregroundStyle(.secondary)
                         }
-                    } else {
-                        Text(state.period.displayName)
-                            .font(.system(size: 9, weight: .medium))
-                            .foregroundStyle(.secondary)
+                        // No +xx/m on the circle. Rate UI was removed on purpose; do not restore.
                     }
-                    // No +xx/m on the circle. Rate UI was removed on purpose; do not restore.
                 }
+                .frame(width: 92, height: 92)
+                .contentShape(Circle())
+                .onTapGesture { PanelController.shared.toggleDetail() }
+                .contextMenu { ContextMenus.view(state: state) }
             }
-            .frame(width: 92, height: 92)
-            .contentShape(Circle())
-            .onTapGesture { PanelController.shared.toggleDetail() }
-            .contextMenu { ContextMenus.view(state: state) }
+            .frame(width: 136, height: 136)
+            .onHover { hovering in PanelController.shared.setQuotaHover(hovering) }
+
+            if state.quotaDisplayMode == .always, hasQuotaData {
+                QuotaStripView(state: state)
+                    .padding(.horizontal, 12)
+                    .padding(.bottom, 8)
+            }
         }
-        .frame(width: 136, height: 136)
         .onAppear { blink = isWaiting }
         .onChange(of: isWaiting) { blink = $0 }
+    }
+
+    private var hasQuotaData: Bool {
+        state.codexQuota != nil || state.cursorQuota != nil
+    }
+
+    @ViewBuilder
+    private var waitingCaption: some View {
+        let tools = sortedWaitingTools
+        if tools.count == 1, let tool = tools.first {
+            VStack(spacing: 1) {
+                HStack(spacing: 3) {
+                    Circle()
+                        .fill(tool.color)
+                        .frame(width: 4.5, height: 4.5)
+                        .modifier(PulseEffect())
+                    Text(tool.displayName)
+                        .font(.system(size: 9, weight: .bold))
+                        .foregroundColor(tool.color)
+                }
+                Text(state.waiting[tool]?.kind == .question ? "等你回答" : "等你确认")
+                    .font(.system(size: 8, weight: .bold))
+                    .foregroundColor(.orange)
+            }
+        } else if !tools.isEmpty {
+            VStack(spacing: 1) {
+                Text("⏳ \(state.waiting.count) 个在等你")
+                    .font(.system(size: 9, weight: .bold))
+                    .foregroundColor(.orange)
+                waitingNamesText
+                    .font(.system(size: 8, weight: .bold))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.6)
+                    .padding(.horizontal, 10)
+            }
+        }
     }
 
     private var ringStyle: AnyShapeStyle {
