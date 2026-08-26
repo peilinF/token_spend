@@ -75,6 +75,17 @@ final class AppState: ObservableObject {
         }
     }
 
+    var widgetScale: Double {
+        get {
+            let v = UserDefaults.standard.object(forKey: "widget_scale") as? Double ?? 1.0
+            return min(2.5, max(1.0, v))
+        }
+        set {
+            UserDefaults.standard.set(min(2.5, max(1.0, newValue)), forKey: "widget_scale")
+            objectWillChange.send()
+        }
+    }
+
     private var lastCodexQuotaRaw: String?
     private var lastCursorQuotaRaw: String?
 

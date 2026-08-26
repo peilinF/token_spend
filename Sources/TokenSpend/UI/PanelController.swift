@@ -15,7 +15,7 @@ final class PanelController: ObservableObject {
     private(set) var detailPanel: PanelWindow!
     private(set) var settingsPanel: PanelWindow!
     private(set) var quotaPanel: PanelWindow!
-    private var quotaHostingView: NSHostingView<QuotaStripView>!
+    private var quotaHostingView: NSView!
     private var monitors: [AnyObject] = []
     private var moveObserver: NSObjectProtocol?
     private var occlusionObserver: NSObjectProtocol?
@@ -67,7 +67,8 @@ final class PanelController: ObservableObject {
 
     private func setupCircle() {
         let view = NSHostingView(rootView: CircleView(state: state, panel: self))
-        let size = view.fittingSize
+        let hasStrip = state.quotaDisplayMode == .always && (state.codexQuota != nil || state.cursorQuota != nil)
+        let size = CircleView.fittedSize(scale: state.widgetScale, hasStrip: hasStrip)
         view.setFrameSize(size)
         circlePanel = makePanel(view, size: size)
         if let saved = loadOrigin(key: "circle_origin") {
@@ -127,7 +128,7 @@ final class PanelController: ObservableObject {
     }
 
     private func setupQuota() {
-        let view = NSHostingView(rootView: QuotaStripView(state: state))
+        let view = NSHostingView(rootView: ScaledQuotaStripView(state: state))
         let size = view.fittingSize
         view.setFrameSize(size)
         quotaHostingView = view
@@ -168,13 +169,17 @@ final class PanelController: ObservableObject {
         if AppState.shared.quotaDisplayMode != .hover {
             quotaPanel.orderOut(nil)
         }
-        guard let view = circlePanel.contentView as? NSHostingView<CircleView> else { return }
-        let size = view.fittingSize
+        let hasStrip = AppState.shared.quotaDisplayMode == .always
+            && (AppState.shared.codexQuota != nil || AppState.shared.cursorQuota != nil)
+        let size = CircleView.fittedSize(scale: AppState.shared.widgetScale, hasStrip: hasStrip)
         guard abs(size.height - circlePanel.frame.height) > 0.5
                 || abs(size.width - circlePanel.frame.width) > 0.5 else { return }
         let topLeft = NSPoint(x: circlePanel.frame.minX, y: circlePanel.frame.maxY)
         circlePanel.setContentSize(size)
         circlePanel.setFrameTopLeftPoint(topLeft)
+        guard let view = circlePanel.contentView as? NSHostingView<CircleView> else { return }
+        view.setFrameSize(size)
+        ensureOnScreen()
     }
 
     func toggleSettings() {

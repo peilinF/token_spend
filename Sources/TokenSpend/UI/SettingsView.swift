@@ -17,6 +17,22 @@ struct SettingsView: View {
             }
             .pickerStyle(.menu)
 
+            HStack(spacing: 8) {
+                Text("界面缩放").font(.system(size: 11))
+                Slider(
+                    value: Binding(
+                        get: { state.widgetScale },
+                        set: { state.widgetScale = (($0 / 0.05).rounded() * 0.05) }
+                    ),
+                    in: 1.0...2.5
+                )
+                .controlSize(.small)
+                Text("\(Int((state.widgetScale * 100).rounded()))%")
+                    .font(.system(size: 10, weight: .semibold))
+                    .monospacedDigit()
+                    .frame(width: 38, alignment: .trailing)
+            }
+
             Picker("额度显示", selection: Binding(
                 get: { state.quotaDisplayMode },
                 set: { state.quotaDisplayMode = $0 }

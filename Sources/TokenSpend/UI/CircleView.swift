@@ -46,7 +46,31 @@ struct CircleView: View {
         return result
     }
 
+    static func naturalHeight(hasStrip: Bool) -> CGFloat {
+        hasStrip ? 206 : 142
+    }
+
+    static func fittedSize(scale: Double, hasStrip: Bool) -> NSSize {
+        let h = naturalHeight(hasStrip: hasStrip)
+        return NSSize(width: 136 * scale, height: h * scale)
+    }
+
+    private var showStripInline: Bool {
+        state.quotaDisplayMode == .always && hasQuotaData
+    }
+
     var body: some View {
+        let scale = CGFloat(state.widgetScale)
+        coreContent
+            .scaleEffect(scale, anchor: .topLeading)
+            .frame(
+                width: 136 * scale,
+                height: Self.naturalHeight(hasStrip: showStripInline) * scale,
+                alignment: .topLeading
+            )
+    }
+
+    private var coreContent: some View {
         VStack(spacing: 6) {
             ZStack {
                 ActivityArcsView(
@@ -103,7 +127,7 @@ struct CircleView: View {
             .frame(width: 136, height: 136)
             .onHover { hovering in PanelController.shared.setQuotaHover(hovering) }
 
-            if state.quotaDisplayMode == .always, hasQuotaData {
+            if showStripInline {
                 QuotaStripView(state: state)
                     .padding(.horizontal, 12)
                     .padding(.bottom, 8)

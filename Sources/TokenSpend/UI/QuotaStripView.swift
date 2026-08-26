@@ -1,5 +1,16 @@
 import SwiftUI
 
+// Wrapper that scales the strip with the widget scale setting.
+struct ScaledQuotaStripView: View {
+    @ObservedObject var state: AppState
+    var body: some View {
+        let s = CGFloat(state.widgetScale)
+        QuotaStripView(state: state)
+            .scaleEffect(s, anchor: .topLeading)
+            .frame(width: 116 * s, height: 84 * s, alignment: .topLeading)
+    }
+}
+
 // Compact quota rows shared by the circle-widget strip and the hover panel.
 // Width budget: the circle window is 136pt wide, so bars stay small and
 // reset-time detail lives in the detail panel instead.
