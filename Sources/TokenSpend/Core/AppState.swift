@@ -32,6 +32,23 @@ final class AppState: ObservableObject {
     @Published private(set) var codexQuota: CodexQuota?
     @Published private(set) var cursorQuota: CursorQuota?
     @Published var isDetailVisible = false
+    @Published private(set) var toolColors: [Tool: Color]
+    @Published var widgetScale: Double {
+        didSet {
+            let clamped = min(2.5, max(1.0, widgetScale))
+            if clamped != widgetScale {
+                widgetScale = clamped
+                return
+            }
+            UserDefaults.standard.set(clamped, forKey: "widget_scale")
+        }
+    }
+    @Published var quotaDisplayMode: QuotaDisplayMode {
+        didSet { UserDefaults.standard.set(quotaDisplayMode.rawValue, forKey: "quota_display") }
+    }
+    @Published var animationFPS: Int {
+        didSet { UserDefaults.standard.set(animationFPS, forKey: "animation_fps") }
+    }
 
     var waitThreshold: TimeInterval {
         get { UserDefaults.standard.object(forKey: "wait_threshold") as? TimeInterval ?? 60 }
@@ -43,60 +60,36 @@ final class AppState: ObservableObject {
         set { UserDefaults.standard.set(newValue, forKey: "cursor_active_interval") }
     }
 
-    var animationFPS: Int {
-        get { UserDefaults.standard.object(forKey: "animation_fps") as? Int ?? 30 }
-        set {
-            UserDefaults.standard.set(newValue, forKey: "animation_fps")
-            objectWillChange.send()
-        }
-    }
-
-    func toolColor(_ tool: Tool) -> Color { tool.color }
+    func toolColor(_ tool: Tool) -> Color { toolColors[tool] ?? tool.color }
 
     func setToolColor(_ tool: Tool, _ color: Color) {
         guard let ns = NSColor(color).usingColorSpace(.sRGB) else { return }
         let raw = String(format: "%.3f,%.3f,%.3f", ns.redComponent, ns.greenComponent, ns.blueComponent)
         UserDefaults.standard.set(raw, forKey: tool.colorKey)
-        objectWillChange.send()
+        var next = toolColors
+        next[tool] = Color(red: ns.redComponent, green: ns.greenComponent, blue: ns.blueComponent)
+        ToolColorCache.replace(next)
+        toolColors = next
     }
 
     func resetToolColors() {
         for tool in Tool.allCases {
             UserDefaults.standard.removeObject(forKey: tool.colorKey)
         }
-        objectWillChange.send()
-    }
-
-    var quotaDisplayMode: QuotaDisplayMode {
-        get { QuotaDisplayMode(rawValue: UserDefaults.standard.string(forKey: "quota_display") ?? "") ?? .always }
-        set {
-            UserDefaults.standard.set(newValue.rawValue, forKey: "quota_display")
-            objectWillChange.send()
-        }
-    }
-
-    var widgetScale: Double {
-        get {
-            let v = UserDefaults.standard.object(forKey: "widget_scale") as? Double ?? 1.0
-            return min(2.5, max(1.0, v))
-        }
-        set {
-            UserDefaults.standard.set(min(2.5, max(1.0, newValue)), forKey: "widget_scale")
-            objectWillChange.send()
-        }
+        let defaults = Tool.defaultColors
+        ToolColorCache.replace(defaults)
+        toolColors = defaults
     }
 
     private var lastCodexQuotaRaw: String?
     private var lastCursorQuotaRaw: String?
 
-    private func refreshQuotas() {
-        let codexRaw = store.meta("codex_rate_limits")
+    private func applyQuotaRaws(codexRaw: String?, cursorRaw: String?) {
         if codexRaw != lastCodexQuotaRaw {
             lastCodexQuotaRaw = codexRaw
             let quota = CodexQuota.decode(fromJSON: codexRaw)
             if quota != codexQuota { codexQuota = quota }
         }
-        let cursorRaw = store.meta("cursor_quota")
         if cursorRaw != lastCursorQuotaRaw {
             lastCursorQuotaRaw = cursorRaw
             let quota = CursorQuota.decode(fromJSON: cursorRaw)
@@ -130,10 +123,16 @@ final class AppState: ObservableObject {
     init() {
         period = Period(rawValue: UserDefaults.standard.string(forKey: "period") ?? "") ?? .day
         mode = UsageMode(rawValue: UserDefaults.standard.string(forKey: "mode") ?? "") ?? .full
+        let scale = UserDefaults.standard.object(forKey: "widget_scale") as? Double ?? 1.0
+        widgetScale = min(2.5, max(1.0, scale))
+        quotaDisplayMode = QuotaDisplayMode(rawValue: UserDefaults.standard.string(forKey: "quota_display") ?? "") ?? .always
+        animationFPS = UserDefaults.standard.object(forKey: "animation_fps") as? Int ?? 30
+        let colors = ToolColorCache.loadAll()
+        ToolColorCache.replace(colors)
+        toolColors = colors
         if let raw = store.meta("cursor_last_sync"), let ts = Double(raw) {
             cursorLastSync = Date(timeIntervalSince1970: ts)
         }
-        refreshQuotas()
         recompute()
     }
 
@@ -187,10 +186,10 @@ final class AppState: ObservableObject {
 
         let monitor = self.waitMonitor
         let threshold = waitThreshold
-        let detected = try? await Task.detached(priority: .utility) { () -> [Tool: WaitingKind] in
-            monitor.poll(threshold: threshold)
+        let detected = await Task.detached(priority: .utility) { () -> [Tool: WaitingKind] in
+            autoreleasepool { monitor.poll(threshold: threshold) }
         }.value
-        applyWaiting(detected ?? [:])
+        applyWaiting(detected)
     }
 
     func handleWake() async {
@@ -201,9 +200,11 @@ final class AppState: ObservableObject {
 
     func runReconcile() async {
         let store = self.store
-        try? await Task.detached(priority: .utility) {
-            OpenCodeSource.reconcile(store: store)
-            CodexSource.reconcile(store: store)
+        await Task.detached(priority: .utility) {
+            autoreleasepool {
+                OpenCodeSource.reconcile(store: store)
+                CodexSource.reconcile(store: store)
+            }
         }.value
         recompute()
     }
@@ -220,12 +221,13 @@ final class AppState: ObservableObject {
 
     private func refreshLocalSources(overlapMS: Int64) async {
         let store = self.store
-        try? await Task.detached(priority: .utility) {
-            try OpenCodeSource.refresh(store: store, overlapMS: overlapMS)
-            try CodexSource.refresh(store: store)
+        await Task.detached(priority: .utility) {
+            autoreleasepool {
+                try? OpenCodeSource.refresh(store: store, overlapMS: overlapMS)
+                try? CodexSource.refresh(store: store)
+            }
         }.value
         recompute()
-        refreshQuotas()
     }
 
     func markSeen(_ tool: Tool) {
@@ -253,39 +255,38 @@ final class AppState: ObservableObject {
         isPolling = true
         defer { isPolling = false }
 
-        let store = self.store
-        let activity = try? await Task.detached(priority: .utility) { () -> Set<Tool> in
-            var active: Set<Tool> = []
-            if OpenCodeSource.isActive(within: 4) { active.insert(.opencode) }
-            if CodexSource.isActive(within: 4) { active.insert(.codex) }
-            // 12s only guards the legacy fallback for cursor logs without
-            // streamFromAgentBackend spans; turn spans decide otherwise.
-            if CursorSource.isActive(within: 12) { active.insert(.cursor) }
-            return active
+        let activity = await Task.detached(priority: .utility) { () -> Set<Tool> in
+            autoreleasepool { () -> Set<Tool> in
+                var active: Set<Tool> = []
+                if OpenCodeSource.isActive(within: 4) { active.insert(.opencode) }
+                if CodexSource.isActive(within: 4) { active.insert(.codex) }
+                // 12s only guards the legacy fallback for cursor logs without
+                // streamFromAgentBackend spans; turn spans decide otherwise.
+                if CursorSource.isActive(within: 12) { active.insert(.cursor) }
+                return active
+            }
         }.value
-        if let activity {
-            let now = Date()
-            for tool in activity {
-                lastSeenActivity[tool] = now
-            }
-            // Turn-level completion is definitive: drop the tool now instead of
-            // letting quietTimeout keep the arc lit for another 14s.
-            if !activity.contains(.codex) { lastSeenActivity.removeValue(forKey: .codex) }
-            if !activity.contains(.cursor) { lastSeenActivity.removeValue(forKey: .cursor) }
-            if activity.contains(.opencode) {
-                opencodeIdleStrikes = 0
-            } else {
-                // "No running part" is heuristic, so confirm idle twice.
-                opencodeIdleStrikes += 1
-                if opencodeIdleStrikes >= 2 { lastSeenActivity.removeValue(forKey: .opencode) }
-            }
-            recomputeActiveTools()
-            if activeTools.contains(.cursor),
-               Date().timeIntervalSince(lastCursorRefresh) >= cursorActiveInterval,
-               Date() >= cursorNextAttempt {
-                lastCursorRefresh = Date()
-                Task { await AppState.shared.refreshCursor() }
-            }
+        let now = Date()
+        for tool in activity {
+            lastSeenActivity[tool] = now
+        }
+        // Turn-level completion is definitive: drop the tool now instead of
+        // letting quietTimeout keep the arc lit for another 14s.
+        if !activity.contains(.codex) { lastSeenActivity.removeValue(forKey: .codex) }
+        if !activity.contains(.cursor) { lastSeenActivity.removeValue(forKey: .cursor) }
+        if activity.contains(.opencode) {
+            opencodeIdleStrikes = 0
+        } else {
+            // "No running part" is heuristic, so confirm idle twice.
+            opencodeIdleStrikes += 1
+            if opencodeIdleStrikes >= 2 { lastSeenActivity.removeValue(forKey: .opencode) }
+        }
+        recomputeActiveTools()
+        if activeTools.contains(.cursor),
+           Date().timeIntervalSince(lastCursorRefresh) >= cursorActiveInterval,
+           Date() >= cursorNextAttempt {
+            lastCursorRefresh = Date()
+            Task { await AppState.shared.refreshCursor() }
         }
 
         await refreshLocalSources(overlapMS: 15_000)
@@ -308,7 +309,6 @@ final class AppState: ObservableObject {
             cursorLastSync = Date()
             cursorFailures = 0
             cursorNextAttempt = .distantPast
-            refreshQuotas()
         } catch KeychainError.denied {
             cursorAuth = .keychainDenied
             applyCursorBackoff(seconds: 1800)
@@ -353,8 +353,21 @@ final class AppState: ObservableObject {
     private var lastSummaryVersion = -1
     private var lastSummaryDay = ""
     private var lastRecomputeAt = Date.distantPast
+    private var recomputeGeneration = 0
+
+    private struct SummarySnapshot {
+        let summary: PeriodSummary?
+        let codexRaw: String?
+        let cursorRaw: String?
+    }
 
     func recompute() {
+        recomputeGeneration += 1
+        let generation = recomputeGeneration
+        Task { await rebuildSummary(generation: generation) }
+    }
+
+    private func rebuildSummary(generation: Int) async {
         let now = Date()
         let day = Fmt.day(now)
         let version = store.dataVersion
@@ -365,12 +378,25 @@ final class AppState: ObservableObject {
         lastSummaryVersion = version
         lastSummaryDay = day
         lastRecomputeAt = now
+
+        let period = self.period
+        let store = self.store
+        let snapshot = await Task.detached(priority: .utility) {
+            autoreleasepool { Self.buildSnapshot(store: store, period: period, now: now) }
+        }.value
+        guard generation == recomputeGeneration else { return }
+        summary = snapshot.summary
+        applyQuotaRaws(codexRaw: snapshot.codexRaw, cursorRaw: snapshot.cursorRaw)
+    }
+
+    nonisolated private static func buildSnapshot(store: UsageStore, period: Period, now: Date) -> SummarySnapshot {
         let range = PeriodMath.range(of: period, now: now)
         let calendar = Calendar.current
+        let codexRaw = store.meta("codex_rate_limits")
+        let cursorRaw = store.meta("cursor_quota")
 
         guard var cursor = calendar.dateComponents([.day], from: range.start, to: now).day, cursor >= 0 else {
-            summary = nil
-            return
+            return SummarySnapshot(summary: nil, codexRaw: codexRaw, cursorRaw: cursorRaw)
         }
         cursor += 1
 
@@ -391,7 +417,8 @@ final class AppState: ObservableObject {
         }
 
         let summaries = Tool.allCases.map { ToolSummary(tool: $0, amount: perToolAmounts[$0] ?? .zero) }
-        summary = PeriodSummary(period: period, start: range.start, end: range.end, progress: range.progress, perTool: summaries, daily: buckets)
+        let built = PeriodSummary(period: period, start: range.start, end: range.end, progress: range.progress, perTool: summaries, daily: buckets)
+        return SummarySnapshot(summary: built, codexRaw: codexRaw, cursorRaw: cursorRaw)
     }
 
     func toggleDetail(circleFrame: NSRect, place: (NSRect) -> Void) {

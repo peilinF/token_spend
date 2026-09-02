@@ -9,14 +9,37 @@ extension Tool {
 
     var colorKey: String { "color_\(rawValue)" }
 
-    var color: Color {
-        if let raw = UserDefaults.standard.string(forKey: colorKey) {
+    var color: Color { ToolColorCache.color(for: self) }
+}
+
+enum ToolColorCache {
+    private static let lock = NSLock()
+    private static var map: [Tool: Color] = Tool.defaultColors
+
+    static func color(for tool: Tool) -> Color {
+        lock.lock()
+        defer { lock.unlock() }
+        return map[tool] ?? Tool.defaultColors[tool] ?? .accentColor
+    }
+
+    static func replace(_ colors: [Tool: Color]) {
+        lock.lock()
+        map = colors
+        lock.unlock()
+    }
+
+    static func loadAll() -> [Tool: Color] {
+        Dictionary(uniqueKeysWithValues: Tool.allCases.map { ($0, load($0)) })
+    }
+
+    static func load(_ tool: Tool) -> Color {
+        if let raw = UserDefaults.standard.string(forKey: tool.colorKey) {
             let parts = raw.split(separator: ",").compactMap { Double($0) }
             if parts.count == 3 {
                 return Color(red: parts[0], green: parts[1], blue: parts[2])
             }
         }
-        return Self.defaultColors[self] ?? .accentColor
+        return Tool.defaultColors[tool] ?? .accentColor
     }
 }
 
@@ -29,7 +52,6 @@ extension Color {
 struct CircleView: View {
     @ObservedObject var state: AppState
     @ObservedObject var panel: PanelController
-    @State private var blink = false
 
     private var isWaiting: Bool { !state.waiting.isEmpty }
 
@@ -86,21 +108,25 @@ struct CircleView: View {
                     Circle()
                         .stroke(Color.primary.opacity(0.12), lineWidth: 1)
 
-                    Circle()
-                        .trim(from: 0, to: state.summary?.progress ?? 0)
-                        .stroke(
-                            ringStyle,
-                            style: StrokeStyle(lineWidth: 3, lineCap: .round)
-                        )
-                        .rotationEffect(.degrees(-90))
-                        .padding(7)
-                        .opacity(blink ? 0.35 : 1)
-                        .animation(
-                            isWaiting
-                                ? .easeInOut(duration: 0.9).repeatForever(autoreverses: true)
-                                : .default,
-                            value: blink
-                        )
+                    TimelineView(.animation(
+                        minimumInterval: 1.0 / Double(max(1, state.animationFPS)),
+                        paused: !isWaiting || panel.circleOccluded
+                    )) { timeline in
+                        let opacity: Double = {
+                            guard isWaiting else { return 1 }
+                            let t = timeline.date.timeIntervalSinceReferenceDate
+                            return 0.35 + 0.65 * (sin(t * .pi / 0.9) + 1) / 2
+                        }()
+                        Circle()
+                            .trim(from: 0, to: state.summary?.progress ?? 0)
+                            .stroke(
+                                ringStyle,
+                                style: StrokeStyle(lineWidth: 3, lineCap: .round)
+                            )
+                            .rotationEffect(.degrees(-90))
+                            .padding(7)
+                            .opacity(opacity)
+                    }
 
                     VStack(spacing: 1) {
                         Text(Fmt.tokens(total))
@@ -133,8 +159,6 @@ struct CircleView: View {
                     .padding(.bottom, 8)
             }
         }
-        .onAppear { blink = isWaiting }
-        .onChange(of: isWaiting) { blink = $0 }
     }
 
     private var hasQuotaData: Bool {
@@ -150,12 +174,12 @@ struct CircleView: View {
                     Circle()
                         .fill(tool.color)
                         .frame(width: 4.5, height: 4.5)
-                        .modifier(PulseEffect())
+                        .modifier(PulseEffect(paused: panel.circleOccluded))
                     Text(tool.displayName)
                         .font(.system(size: 9, weight: .bold))
                         .foregroundColor(tool.color)
                 }
-                Text(state.waiting[tool]?.kind == .question ? "等你回答" : "等你确认")
+                Text(state.waiting[tool]?.kind.label ?? "等你确认")
                     .font(.system(size: 8, weight: .bold))
                     .foregroundColor(.orange)
             }
@@ -190,13 +214,13 @@ struct ActivityArcsView: View {
     let tools: [Tool]
     let paused: Bool
     let fps: Int
-    @State private var glowPulse = false
 
     var body: some View {
         TimelineView(.animation(minimumInterval: 1.0 / Double(max(1, fps)), paused: paused || tools.isEmpty)) { timeline in
             let t = timeline.date.timeIntervalSinceReferenceDate
             let spin = (t * 115).truncatingRemainder(dividingBy: 360)
             let wobble = sin(t * 3.2) * 0.7 + 0.3
+            let pulse = 0.985 + 0.035 * (sin(t * 5.7) + 1) / 2
 
             ZStack {
                 if !tools.isEmpty {
@@ -225,9 +249,7 @@ struct ActivityArcsView: View {
             }
             .frame(width: 92, height: 92)
             .rotationEffect(.degrees(spin))
-            .scaleEffect(glowPulse ? 1.02 : 0.985)
-            .animation(.easeInOut(duration: 1.1).repeatForever(autoreverses: true), value: glowPulse)
-            .onAppear { glowPulse = true }
+            .scaleEffect(pulse)
         }
     }
 
@@ -316,14 +338,16 @@ struct ActivityArcsView: View {
 }
 
 struct PulseEffect: ViewModifier {
-    @State private var pulsing = false
+    var paused: Bool = false
 
     func body(content: Content) -> some View {
-        content
-            .scaleEffect(pulsing ? 1.6 : 0.7)
-            .opacity(pulsing ? 0.35 : 1)
-            .animation(.easeInOut(duration: 0.8).repeatForever(autoreverses: true), value: pulsing)
-            .onAppear { pulsing = true }
+        TimelineView(.animation(minimumInterval: 0.05, paused: paused)) { timeline in
+            let t = timeline.date.timeIntervalSinceReferenceDate
+            let wave = (sin(t * .pi / 0.4) + 1) / 2
+            content
+                .scaleEffect(0.7 + 0.9 * wave)
+                .opacity(1 - 0.65 * wave)
+        }
     }
 }
 

@@ -57,18 +57,17 @@ enum CursorSource {
     // streamFromAgentBackend spans bracket an agent request end to end; the
     // later of the last start/complete lines decides if cursor is mid-turn.
     private static func tailStreamSpanState(_ url: URL) -> StreamSpanState {
-        FileResultCache.shared.value(for: url) {
+        FileResultCache.shared.value(for: url, namespace: "cursor_stream_span") {
             guard let handle = try? FileHandle(forReadingFrom: url) else { return .absent }
             defer { try? handle.close() }
             let size = Int64((try? handle.seekToEnd()) ?? 0)
-            try? handle.seek(toOffset: UInt64(max(0, size - 2_000_000)))
-            guard let data = try? handle.readToEnd(),
-                  let text = String(data: data, encoding: .utf8) else { return .absent }
-            let started = text.range(of: "span_started name=\"streamFromAgentBackend\"", options: .backwards)?.lowerBound
-            let completed = text.range(of: "span_completed name=\"streamFromAgentBackend\"", options: .backwards)?.lowerBound
+            try? handle.seek(toOffset: UInt64(max(0, size - 512_000)))
+            guard let data = try? handle.readToEnd(), !data.isEmpty else { return .absent }
+            let started = data.range(of: Data(#"span_started name="streamFromAgentBackend""#.utf8), options: .backwards)
+            let completed = data.range(of: Data(#"span_completed name="streamFromAgentBackend""#.utf8), options: .backwards)
             switch (started, completed) {
             case let (s?, c?):
-                return s > c ? .open : .closed
+                return s.lowerBound > c.lowerBound ? .open : .closed
             case (.some, nil):
                 return .open
             case (nil, .some):
@@ -213,10 +212,10 @@ enum CursorSource {
         migrateKeysIfNeeded(store: store)
 
         let now = Date()
-        let existing = store.meta("cursor_last_ts").flatMap { Double($0) } ?? 0
+        var existing = store.meta("cursor_last_ts").flatMap { Double($0) } ?? 0
         let incremental = existing > 0
-        let startMs: Double
-        let pageLimit: Int
+        var startMs: Double
+        var pageLimit: Int
         if incremental {
             startMs = max(0, existing - 30 * 60_000)
             pageLimit = 3
@@ -230,6 +229,9 @@ enum CursorSource {
         var total = Int.max
         var maxTs: Double = existing
         var previousPageMinTs: Double = 0
+        var storedAccount = store.meta("cursor_account_id") ?? ""
+        var detectedAccount: String?
+        var didSwitchAccount = false
 
         while fetched < total && page <= pageLimit {
             let body: [String: Any] = [
@@ -250,11 +252,15 @@ enum CursorSource {
 
             var pageMinTs = Double.greatestFiniteMagnitude
             var pageMaxTs: Double = 0
+            var pageOwningUser: String?
 
             for event in events {
                 guard let tsStr = event["timestamp"] as? String, let ts = Double(tsStr) else { continue }
                 pageMinTs = min(pageMinTs, ts)
                 pageMaxTs = max(pageMaxTs, ts)
+                if pageOwningUser == nil, let u = event["owningUser"] as? String, !u.isEmpty, u != "0" {
+                    pageOwningUser = u
+                }
 
                 let tokenUsage = event["tokenUsage"] as? [String: Any] ?? [:]
                 var amount = UsageAmount()
@@ -276,6 +282,21 @@ enum CursorSource {
                 maxTs = max(maxTs, ts)
             }
 
+            if let u = pageOwningUser {
+                if detectedAccount == nil { detectedAccount = u }
+                if !storedAccount.isEmpty, u != storedAccount, !didSwitchAccount {
+                    didSwitchAccount = true
+                    // 新账号的旧历史在增量窗口外，需要回溯 400 天补齐，但保留旧号数据
+                    startMs = now.timeIntervalSince1970 * 1000 - 400 * 86_400_000
+                    pageLimit = 60
+                    existing = 0
+                    previousPageMinTs = 0
+                    // 已抓的这页是新号的近期数据，已入库，继续拉更早的页
+                } else if storedAccount.isEmpty {
+                    storedAccount = u
+                }
+            }
+
             fetched += events.count
             if events.isEmpty { break }
 
@@ -287,6 +308,9 @@ enum CursorSource {
             page += 1
         }
         store.setMeta("cursor_last_ts", String(maxTs))
+        if let account = detectedAccount, !account.isEmpty {
+            store.setMeta("cursor_account_id", account)
+        }
     }
 
     private static func eventKey(_ event: [String: Any], ts: Double, conv: String, kind: String) -> String {

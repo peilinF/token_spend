@@ -58,16 +58,30 @@ enum Fmt {
         return "$" + String(format: "%.2f", v)
     }
 
-    static func time(_ date: Date) -> String {
+    private static let timeFormatter: DateFormatter = {
         let f = DateFormatter()
         f.dateFormat = "HH:mm:ss"
-        return f.string(from: date)
+        f.locale = Locale(identifier: "en_US_POSIX")
+        return f
+    }()
+
+    private static let shortDateFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "MM-dd"
+        f.locale = Locale(identifier: "en_US_POSIX")
+        return f
+    }()
+
+    static func time(_ date: Date) -> String {
+        fmtLock.lock()
+        defer { fmtLock.unlock() }
+        return timeFormatter.string(from: date)
     }
 
     static func shortDate(_ date: Date) -> String {
-        let f = DateFormatter()
-        f.dateFormat = "MM-dd"
-        return f.string(from: date)
+        fmtLock.lock()
+        defer { fmtLock.unlock() }
+        return shortDateFormatter.string(from: date)
     }
 }
 

@@ -18,6 +18,10 @@ enum CursorLogs {
         files(named: "renderer.log", newerThan: cutoff)
     }
 
+    static func agentExecLogs(newerThan cutoff: Date) -> [(url: URL, mtime: Date)] {
+        files(named: "Cursor Agent Exec.log", newerThan: cutoff)
+    }
+
     static func newestRequestTrace() -> (url: URL, mtime: Date)? {
         requestTraceLogs(newerThan: Date.distantPast).first
     }
@@ -32,7 +36,7 @@ enum CursorLogs {
         let now = Date()
         if now.timeIntervalSince(lastScanAt) > 5 {
             scanned = [:]
-            for name in ["cursor.requestTraces.log", "renderer.log"] {
+            for name in ["cursor.requestTraces.log", "renderer.log", "Cursor Agent Exec.log"] {
                 scanned[name] = scan(fileName: name, in: logsDir)
             }
             lastScanAt = now

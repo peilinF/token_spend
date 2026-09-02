@@ -13,11 +13,16 @@ final class StatusBarController {
     private var cancellable: AnyCancellable?
     private var iconCancellable: AnyCancellable?
     private var quotaCancellable: AnyCancellable?
+    private var lastIconSignature: String?
+    private let idleIcon = NSImage(systemSymbolName: "chart.donut.fill", accessibilityDescription: "TokenSpend")
+    private let waitQuestionIcon = NSImage(systemSymbolName: "exclamationmark.circle.fill", accessibilityDescription: "TokenSpend 等你回答")
+    private let waitPermissionIcon = NSImage(systemSymbolName: "exclamationmark.circle.fill", accessibilityDescription: "TokenSpend 等你授权")
+    private let waitGenericIcon = NSImage(systemSymbolName: "exclamationmark.circle.fill", accessibilityDescription: "TokenSpend 等待确认")
 
     func install() {
         guard statusItem == nil else { return }
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        item.button?.image = NSImage(systemSymbolName: "chart.donut.fill", accessibilityDescription: "TokenSpend")
+        item.button?.image = idleIcon
         item.menu = buildMenu()
         statusItem = item
 
@@ -27,8 +32,8 @@ final class StatusBarController {
                 self?.refreshIcon()
                 self?.rebuild()
             }
-        // Tool colors can change from the settings panel; keep the dots in sync.
-        iconCancellable = AppState.shared.objectWillChange
+        iconCancellable = AppState.shared.$toolColors
+            .dropFirst()
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in
                 self?.refreshIcon()
@@ -61,17 +66,28 @@ final class StatusBarController {
     private func refreshIcon() {
         guard let button = statusItem?.button else { return }
         let waiting = AppState.shared.waiting
+        let signature = iconSignature(waiting)
+        guard signature != lastIconSignature else { return }
+        lastIconSignature = signature
         if waiting.isEmpty {
-            button.image = NSImage(systemSymbolName: "chart.donut.fill", accessibilityDescription: "TokenSpend")
+            button.image = idleIcon
             button.contentTintColor = nil
             button.attributedTitle = NSAttributedString(string: "")
             button.toolTip = nil
         } else {
-            let asking = waiting.values.contains { $0.kind == .question }
-            button.image = NSImage(
-                systemSymbolName: "exclamationmark.circle.fill",
-                accessibilityDescription: asking ? "TokenSpend 等你回答" : "TokenSpend 等待确认"
-            )
+            let hasQuestion = waiting.values.contains { $0.kind == .question }
+            let hasPermission = waiting.values.contains { $0.kind == .permission }
+            let suffix: String
+            if hasQuestion {
+                button.image = waitQuestionIcon
+                suffix = " 等你回答"
+            } else if hasPermission {
+                button.image = waitPermissionIcon
+                suffix = " 等你授权"
+            } else {
+                button.image = waitGenericIcon
+                suffix = " 等待确认"
+            }
             button.contentTintColor = .systemOrange
             let sorted = waiting.keys.sorted(by: { $0.rawValue < $1.rawValue })
             let dots = NSMutableAttributedString(string: " ")
@@ -80,8 +96,21 @@ final class StatusBarController {
             }
             button.attributedTitle = dots
             let names = sorted.map(\.displayName).joined(separator: "、")
-            button.toolTip = names + (asking ? " 等你回答" : " 等待确认")
+            button.toolTip = names + suffix
         }
+    }
+
+    private func iconSignature(_ waiting: [Tool: WaitingInfo]) -> String {
+        if waiting.isEmpty { return "idle" }
+        let colors = AppState.shared.toolColors
+        return waiting
+            .sorted { $0.key.rawValue < $1.key.rawValue }
+            .map { tool, info in
+                let rgb = NSColor(colors[tool] ?? tool.color).usingColorSpace(.sRGB)
+                let bits = rgb.map { String(format: "%.3f,%.3f,%.3f", $0.redComponent, $0.greenComponent, $0.blueComponent) } ?? "?"
+                return "\(tool.rawValue):\(info.kind):\(bits)"
+            }
+            .joined(separator: "|")
     }
 
     private func buildMenu() -> NSMenu {
@@ -99,7 +128,15 @@ final class StatusBarController {
         if !waiting.isEmpty {
             let summary = waiting
                 .sorted(by: { $0.key.rawValue < $1.key.rawValue })
-                .map { tool, info in "\(tool.displayName)·\(info.kind == .question ? "答" : "疑")" }
+                .map { tool, info in
+                    let short: String
+                    switch info.kind {
+                    case .question: short = "答"
+                    case .permission: short = "授"
+                    case .stalled: short = "疑"
+                    }
+                    return "\(tool.displayName)·\(short)"
+                }
                 .joined(separator: " / ")
             let statusLine = NSMenuItem(
                 title: "⏳ \(waiting.count) 个在等：\(summary)",
@@ -174,6 +211,10 @@ final class StatusBarController {
         refreshItem.target = self
         menu.addItem(refreshItem)
 
+        let diagItem = NSMenuItem(title: "导出诊断日志", action: #selector(exportDiagnostics(_:)), keyEquivalent: "")
+        diagItem.target = self
+        menu.addItem(diagItem)
+
         menu.addItem(.separator())
         let quit = NSMenuItem(title: "退出 TokenSpend", action: #selector(quit(_:)), keyEquivalent: "q")
         quit.target = self
@@ -235,6 +276,10 @@ final class StatusBarController {
 
     @objc private func refreshNow(_ sender: NSMenuItem) {
         Task { await AppState.shared.refreshAll(force: true) }
+    }
+
+    @objc private func exportDiagnostics(_ sender: NSMenuItem) {
+        Diagnostics.revealLog()
     }
 
     @objc private func quit(_ sender: NSMenuItem) {

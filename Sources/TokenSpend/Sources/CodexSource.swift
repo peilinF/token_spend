@@ -28,18 +28,17 @@ enum CodexSource {
     }
 
     private static func lastTaskMarker(_ file: URL) -> TaskMarker {
-        FileResultCache.shared.value(for: file) {
+        FileResultCache.shared.value(for: file, namespace: "codex_last_task") {
             guard let handle = try? FileHandle(forReadingFrom: file) else { return .none }
             defer { try? handle.close() }
             let size = Int64((try? handle.seekToEnd()) ?? 0)
-            try? handle.seek(toOffset: UInt64(max(0, size - 2_000_000)))
-            guard let data = try? handle.readToEnd(),
-                  let text = String(data: data, encoding: .utf8) else { return .none }
-            let started = text.range(of: "\"type\":\"task_started\"", options: .backwards)?.lowerBound
-            let completed = text.range(of: "\"type\":\"task_complete\"", options: .backwards)?.lowerBound
+            try? handle.seek(toOffset: UInt64(max(0, size - 512_000)))
+            guard let data = try? handle.readToEnd(), !data.isEmpty else { return .none }
+            let started = data.range(of: Data("\"type\":\"task_started\"".utf8), options: .backwards)
+            let completed = data.range(of: Data("\"type\":\"task_complete\"".utf8), options: .backwards)
             switch (started, completed) {
             case let (s?, c?):
-                return s > c ? .started : .completed
+                return s.lowerBound > c.lowerBound ? .started : .completed
             case (.some, nil):
                 return .started
             default:

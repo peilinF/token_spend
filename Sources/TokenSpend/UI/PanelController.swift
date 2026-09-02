@@ -38,9 +38,14 @@ final class PanelController: ObservableObject {
             let occluded = !window.occlusionState.contains(.visible)
             Task { @MainActor in self.circleOccluded = occluded }
         }
-        fitCancellable = AppState.shared.objectWillChange
-            .receive(on: DispatchQueue.main)
-            .sink { [weak self] _ in self?.refitCircle() }
+        fitCancellable = Publishers.CombineLatest4(
+            AppState.shared.$widgetScale,
+            AppState.shared.$quotaDisplayMode,
+            AppState.shared.$codexQuota,
+            AppState.shared.$cursorQuota
+        )
+        .receive(on: DispatchQueue.main)
+        .sink { [weak self] _ in self?.refitCircle() }
     }
 
     private func makePanel(_ content: NSView, size: NSSize, activating: Bool = false) -> PanelWindow {

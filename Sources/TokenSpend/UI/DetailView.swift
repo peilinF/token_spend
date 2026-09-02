@@ -81,7 +81,7 @@ struct DetailView: View {
             .map { ($0.key, $0.value) }
             .sorted { a, b in
                 if a.info.kind != b.info.kind {
-                    return a.info.kind == .question
+                    return a.info.kind.priority < b.info.kind.priority
                 }
                 return a.info.since < b.info.since
             }
@@ -90,7 +90,7 @@ struct DetailView: View {
     private var bannerText: String {
         sortedWaiting.map { tool, info in
             switch info.kind {
-            case .question:
+            case .question, .permission:
                 return "\(tool.displayName) \(info.kind.label)"
             case .stalled:
                 let secs = Int(Date().timeIntervalSince(info.since))

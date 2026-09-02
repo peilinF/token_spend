@@ -8,6 +8,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             PanelController.shared.showCircle()
         }
         StatusBarController.shared.install()
+        Diagnostics.start()
         AppState.shared.startEngine()
     }
 }

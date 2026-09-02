@@ -31,7 +31,7 @@
 - **周期切换**：今日 / 本周（周一起始）/ 本月 / 今年，本地时区
 - **双统计口径**：精简 = input（不含 cache）+ output；全量 = 含 cache read/write
 - **详情面板**：分工具明细、占比条、额度条、近 7 天堆叠柱状图、费用、Cursor 登录状态
-- **菜单栏**：额度摘要行、等待行、切周期/口径、阈值与同步间隔、显示/隐藏圆窗、偏好设置、开机自启、立即刷新
+- **菜单栏**：额度摘要行、等待行、切周期/口径、阈值与同步间隔、显示/隐藏圆窗、偏好设置、开机自启、立即刷新、导出诊断日志
 - **CLI 调试**：`--print-summary` / `--print-live` / `--print-waiting` / `--print-quota` / `--reconcile`
 
 ## 数据来源
@@ -122,6 +122,32 @@ rm key.pem cert.pem
 - codex 5h 窗口重置显示短窗口用时刻、长窗口用日期（由 `window_minutes` 决定）
 - 圆窗不显示每分钟速率（`+xx/m` 已取消）
 
+## 卡顿排查
+
+长时间运行后如果圆窗或面板变卡，先开诊断日志（默认关闭），跑 2 小时以上看 `footprint_mb` 斜率和 `main_stall` 条数：
+
+```bash
+defaults write com.peilin.tokenspend diag_enabled -bool true
+# 重启 TokenSpend 后，状态栏菜单「导出诊断日志」打开
+# ~/Library/Application Support/TokenSpend/diag.log
+```
+
+关诊断：
+
+```bash
+defaults write com.peilin.tokenspend diag_enabled -bool false
+```
+
+判定：footprint 持续上涨更像泄漏；footprint 平稳但 `main_stall` 增多或 CPU 抬升，更像主线程卡住 / 动画残留。卡顿当下可再采：
+
+```bash
+sample TokenSpend 10 -file /tmp/ts.txt
+leaks $(pgrep -x TokenSpend)
+footprint $(pgrep -x TokenSpend)
+```
+
+Instruments：Allocations（Record reference counts）+ Leaks + Time Profiler，跑 1–2 小时对比 Persistent；SwiftUI instrument 看 View Body 次数是否随时间上升。
+
 ## 目录结构
 
 ```
@@ -134,6 +160,7 @@ Sources/TokenSpend/
 │   ├── ActivityWatcher.swift # 文件变更即时点亮（2s retarget, 0.3s 去抖）
 │   ├── UsageStore.swift    # 自有 SQLite（contrib/meta，版本号脏检查）
 │   ├── WaitingDetector.swift # 等待/停滞检测
+│   ├── Diagnostics.swift   # 可选 footprint / 主线程卡顿日志
 │   ├── SQLite.swift
 │   ├── Fmt.swift           # 数字/日期格式化 + 线程安全 ISO8601 + 周期数学
 │   └── LaunchAtLogin.swift

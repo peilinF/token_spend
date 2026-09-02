@@ -107,12 +107,22 @@ struct UsageAmount: AdditiveArithmetic {
 
 enum WaitingKind: Equatable {
     case question
+    case permission
     case stalled
 
     var label: String {
         switch self {
         case .question: return "等你回答"
+        case .permission: return "等你授权"
         case .stalled: return "疑似等待确认"
+        }
+    }
+
+    var priority: Int {
+        switch self {
+        case .question: return 0
+        case .permission: return 1
+        case .stalled: return 2
         }
     }
 }
