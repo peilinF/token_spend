@@ -151,9 +151,16 @@ final class WaitingMonitor {
             ocPendingPermissions.removeAll()
             return false
         }
-        // Primary signal: log file "asking id=per_..." with recent timestamp and a running part
-        if hasRecentOpencodePermissionAsking(now: now) {
-            if hasRunningOpencodePart(now: now) {
+        // Primary signal: log file "asking id=per_..." with a running part.
+        // Progress guard: answering (Allow) sets the agent back to work, so a
+        // prompt followed by newer part progress means running, not waiting.
+        // (per_* answers leave no reply line in the log; progress is the only
+        // signal that the prompt was resolved.)
+        if let askingTs = latestOpencodePermissionAsking(now: now) {
+            if let progressTs = WaitingDetector.latestRunningOpencodeProgress(),
+               progressTs > askingTs.addingTimeInterval(30) {
+                Diagnostics.debug("opencode permission suppressed: progress after asking")
+            } else if hasRunningOpencodePart(now: now) {
                 return true
             }
         }
@@ -225,19 +232,23 @@ final class WaitingMonitor {
         return !ocPendingPermissions.isEmpty
     }
 
-    private func hasRecentOpencodePermissionAsking(now: Date) -> Bool {
+    /// Latest `message=asking id=per_*` timestamp (nil if none in 24h).
+    /// Returned from file content only (no wall-clock math inside), so the
+    /// FileResultCache entry can't go stale while the log is quiet.
+    private func latestOpencodePermissionAsking(now: Date) -> Date? {
         let logURL = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".local/share/opencode/log/opencode.log")
-        guard FileManager.default.fileExists(atPath: logURL.path) else { return false }
-        let cutoff = now.addingTimeInterval(-120)
+        guard FileManager.default.fileExists(atPath: logURL.path) else { return nil }
+        let cutoff = now.addingTimeInterval(-86_400)
         return FileResultCache.shared.value(for: logURL, namespace: "opencode_perm_log") {
-            guard let handle = try? FileHandle(forReadingFrom: logURL) else { return false }
+            guard let handle = try? FileHandle(forReadingFrom: logURL) else { return nil as Date? }
             defer { try? handle.close() }
             let size = Int64((try? handle.seekToEnd()) ?? 0)
             let readStart = max(0, size - 262_144)
             try? handle.seek(toOffset: UInt64(readStart))
             guard let data = try? handle.readToEnd(),
-                  let text = String(data: data, encoding: .utf8) else { return false }
+                  let text = String(data: data, encoding: .utf8) else { return nil as Date? }
+            var latest: Date?
             for line in text.split(separator: "\n") {
                 guard line.contains("message=asking") && line.contains("per_") else { continue }
                 // parse timestamp=2026-08-27T07:48:10.144Z
@@ -247,14 +258,14 @@ final class WaitingMonitor {
                         let tsStr = String(after[..<end])
                         if let date = Formatters.isoFractional.date(from: tsStr) ?? Formatters.isoPlain.date(from: tsStr) {
                             if date < cutoff { continue }
+                            if latest == nil || date > latest! { latest = date }
                         }
                     }
                 } else {
                     continue
                 }
-                return true
             }
-            return false
+            return latest
         }
     }
 
@@ -279,6 +290,13 @@ final class WaitingMonitor {
         guard WaitingDetector.processAlive(named: "opencode"),
               FileManager.default.fileExists(atPath: OpenCodeSource.dbPath),
               let db = try? SQLiteDatabase(path: OpenCodeSource.dbPath, readonly: true) else { return false }
+
+        // A worker descendant (shell/interpreter/build tool) means a command
+        // is executing, even if no part row was touched recently.
+        if WaitingDetector.hasWorkerChild(parentPrefix: "opencode") {
+            Diagnostics.debug("opencode stalled suppressed: worker child running")
+            return false
+        }
 
         var staleCount = 0
         let staleUpper = Int64((now.addingTimeInterval(-threshold)).timeIntervalSince1970 * 1000)
@@ -311,19 +329,20 @@ enum WaitingDetector {
         return result
     }
 
-    private static func hasRecentOpencodePermissionLog(now: Date) -> Bool {
+    private static func latestOpencodePermissionAsking(now: Date) -> Date? {
         let logURL = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".local/share/opencode/log/opencode.log")
-        guard FileManager.default.fileExists(atPath: logURL.path) else { return false }
-        let cutoff = now.addingTimeInterval(-120)
-        return FileResultCache.shared.value(for: logURL, namespace: "opencode_perm_log") {
-            guard let handle = try? FileHandle(forReadingFrom: logURL) else { return false }
+        guard FileManager.default.fileExists(atPath: logURL.path) else { return nil }
+        let cutoff = now.addingTimeInterval(-86_400)
+        return FileResultCache.shared.value(for: logURL, namespace: "opencode_perm_log_oneshot") {
+            guard let handle = try? FileHandle(forReadingFrom: logURL) else { return nil as Date? }
             defer { try? handle.close() }
             let size = Int64((try? handle.seekToEnd()) ?? 0)
             let readStart = max(0, size - 262_144)
             try? handle.seek(toOffset: UInt64(readStart))
             guard let data = try? handle.readToEnd(),
-                  let text = String(data: data, encoding: .utf8) else { return false }
+                  let text = String(data: data, encoding: .utf8) else { return nil as Date? }
+            var latest: Date?
             for line in text.split(separator: "\n") {
                 guard line.contains("message=asking") && line.contains("per_") else { continue }
                 if let tsRange = line.range(of: "timestamp=") {
@@ -332,12 +351,12 @@ enum WaitingDetector {
                         let tsStr = String(after[..<end])
                         if let date = Formatters.isoFractional.date(from: tsStr) ?? Formatters.isoPlain.date(from: tsStr) {
                             if date < cutoff { continue }
+                            if latest == nil || date > latest! { latest = date }
                         }
                     }
                 } else { continue }
-                return true
             }
-            return false
+            return latest
         }
     }
 
@@ -353,6 +372,20 @@ enum WaitingDetector {
         return found
     }
 
+    /// Newest `time_updated` among running parts. Progress after a permission
+    /// asking proves the prompt was answered and the agent is working.
+    static func latestRunningOpencodeProgress() -> Date? {
+        guard FileManager.default.fileExists(atPath: OpenCodeSource.dbPath),
+              let db = try? SQLiteDatabase(path: OpenCodeSource.dbPath, readonly: true) else { return nil }
+        var maxUpdated: Int64 = 0
+        try? db.query(
+            "SELECT MAX(time_updated) FROM part WHERE json_extract(data,'$.state.status')='running'",
+            binds: []
+        ) { row in maxUpdated = row.int(0) }
+        guard maxUpdated > 0 else { return nil }
+        return Date(timeIntervalSince1970: Double(maxUpdated) / 1000)
+    }
+
     private static func opencodeStalledOneShot(threshold: TimeInterval, now: Date) -> WaitingKind? {
         guard processAlive(named: "opencode"),
               FileManager.default.fileExists(atPath: OpenCodeSource.dbPath),
@@ -366,8 +399,13 @@ enum WaitingDetector {
         ) { row in questionCount = Int(row.int(0)) }
         if questionCount > 0 { return .question }
 
-        if hasRecentOpencodePermissionLog(now: now), hasRunningOpencodePart(now: now) {
-            return .permission
+        // Same progress guard as the live path: an asking followed by newer
+        // part progress means the prompt was answered and work resumed.
+        if let askingTs = latestOpencodePermissionAsking(now: now) {
+            let progressed = latestRunningOpencodeProgress().map { $0 > askingTs.addingTimeInterval(30) } ?? false
+            if !progressed, hasRunningOpencodePart(now: now) {
+                return .permission
+            }
         }
         var permCount = 0
         try? db.query(
@@ -376,6 +414,9 @@ enum WaitingDetector {
             binds: []
         ) { row in permCount = Int(row.int(0)) }
         if permCount > 0 { return .permission }
+
+        // Worker descendant = command executing, not stuck (see live path).
+        if hasWorkerChild(parentPrefix: "opencode") { return nil }
 
         var staleCount = 0
         let staleUpper = Int64((now.addingTimeInterval(-threshold)).timeIntervalSince1970 * 1000)
@@ -392,12 +433,15 @@ enum WaitingDetector {
     private static let procCacheLock = NSLock()
     private static var procCacheAt = Date.distantPast
     private static var procNames: Set<String> = []
+    private static var procTable: [(pid: Int32, ppid: Int32, comm: String)] = []
 
     static func processAlive(named name: String) -> Bool {
         procCacheLock.lock()
         let now = Date()
         if now.timeIntervalSince(procCacheAt) > 3 {
-            procNames = scanProcessNames()
+            let scanned = scanProcesses()
+            procNames = scanned.names
+            procTable = scanned.table
             procCacheAt = now
         }
         let hit = procNames.contains { $0.hasPrefix(name) }
@@ -405,29 +449,91 @@ enum WaitingDetector {
         return hit
     }
 
-    private static func scanProcessNames() -> Set<String> {
+    /// True when a worker-like process (shell, interpreter, build tool…)
+    /// descends from `name`. Means the agent is executing commands, not
+    /// waiting: callers suppress only `.stalled`, never explicit
+    /// question/permission markers.
+    static func hasWorkerChild(parentPrefix name: String) -> Bool {
+        procCacheLock.lock()
+        let now = Date()
+        if now.timeIntervalSince(procCacheAt) > 3 {
+            let scanned = scanProcesses()
+            procNames = scanned.names
+            procTable = scanned.table
+            procCacheAt = now
+        }
+        let table = procTable
+        procCacheLock.unlock()
+        guard !table.isEmpty else { return false }
+        var byPid: [Int32: (ppid: Int32, comm: String)] = [:]
+        byPid.reserveCapacity(table.count)
+        for e in table { byPid[e.pid] = (e.ppid, e.comm) }
+        for e in table {
+            guard isWorkerComm(e.comm) else { continue }
+            var pid = e.ppid
+            var depth = 0
+            while depth < 8, let parent = byPid[pid] {
+                if parent.comm.hasPrefix(name) { return true }
+                if pid == 1 { break }
+                pid = parent.ppid
+                depth += 1
+            }
+        }
+        return false
+    }
+
+    private static func isWorkerComm(_ comm: String) -> Bool {
+        let c = comm.lowercased()
+        for prefix in workerCommPrefixes where c.hasPrefix(prefix) { return true }
+        return false
+    }
+
+    /// Shells, interpreters, build tools, VCS, file/network verbs an agent
+    /// typically spawns for `exec`/bash calls. Matched by prefix against the
+    /// (16-char truncated) process comm, lowercased.
+    private static let workerCommPrefixes = [
+        "sh", "bash", "zsh", "fish", "dash",
+        "python", "node", "deno", "bun", "ruby", "perl", "php", "lua",
+        "go", "java", "cargo", "rustc", "swift", "swiftc", "clang", "gcc", "g++",
+        "npm", "yarn", "pnpm", "make", "cmake", "ninja", "gradle", "mvn",
+        "docker", "git", "rg", "grep", "sed", "awk", "find", "xargs",
+        "ffmpeg", "ssh", "scp", "rsync", "curl", "wget", "tar", "zip", "unzip",
+        "tsc", "eslint", "vite", "jest", "pytest", "terraform", "kubectl",
+    ]
+
+    private static func scanProcesses() -> (names: Set<String>, table: [(pid: Int32, ppid: Int32, comm: String)]) {
         var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_ALL]
         var size = 0
-        guard sysctl(&mib, u_int(mib.count), nil, &size, nil, 0) == 0, size > 0 else { return [] }
+        guard sysctl(&mib, u_int(mib.count), nil, &size, nil, 0) == 0, size > 0 else {
+            return ([], [])
+        }
         for _ in 0..<2 {
             var procs = [kinfo_proc](repeating: kinfo_proc(), count: size / MemoryLayout<kinfo_proc>.stride)
             var newSize = size
-            guard sysctl(&mib, u_int(mib.count), &procs, &newSize, nil, 0) == 0 else { return [] }
+            guard sysctl(&mib, u_int(mib.count), &procs, &newSize, nil, 0) == 0 else { return ([], []) }
             if newSize <= size {
                 let count = newSize / MemoryLayout<kinfo_proc>.stride
                 var names: Set<String> = []
+                var table: [(Int32, Int32, String)] = []
                 names.reserveCapacity(count / 2)
+                table.reserveCapacity(count)
                 for i in 0..<count {
                     let comm = withUnsafeBytes(of: procs[i].kp_proc.p_comm) { raw -> String in
                         String(cString: raw.baseAddress!.assumingMemoryBound(to: CChar.self))
                     }
-                    if !comm.isEmpty { names.insert(comm) }
+                    guard !comm.isEmpty else { continue }
+                    names.insert(comm)
+                    table.append((procs[i].kp_proc.p_pid, procs[i].kp_eproc.e_ppid, comm))
                 }
-                return names
+                return (names, table)
             }
             size = newSize
         }
-        return []
+        return ([], [])
+    }
+
+    private static func scanProcessNames() -> Set<String> {
+        scanProcesses().names
     }
 
     // MARK: - codex
@@ -469,15 +575,27 @@ enum WaitingDetector {
         guard !recentFiles.isEmpty else { return nil }
 
         let candidates = recentFiles.prefix(8)
-        if candidates.contains(where: { hasOpenRequestUserInput($0.0) }) {
+        if candidates.contains(where: { hasOpenRequestUserInput($0.0).question }) {
             return .question
         }
         if candidates.contains(where: { hasOpenPermissionRequest($0.0) }) {
             return .permission
         }
 
+        // A worker descendant (exec backend child) means a command is
+        // executing, even if the file went quiet.
+        let workerRunning = hasWorkerChild(parentPrefix: "codex")
         for (file, mtime) in candidates where mtime > activeCutoff {
             guard lastMarkerIsOpenTask(file) else { continue }
+            // An open `wait` cell call = polling a background command.
+            if hasOpenRequestUserInput(file).runningWait {
+                Diagnostics.debug("codex stalled suppressed: open wait call")
+                continue
+            }
+            if workerRunning {
+                Diagnostics.debug("codex stalled suppressed: worker child running")
+                continue
+            }
             if mtime < now.addingTimeInterval(-threshold) {
                 return .stalled
             }
@@ -485,24 +603,31 @@ enum WaitingDetector {
         return nil
     }
 
-    private static func hasOpenRequestUserInput(_ file: URL) -> Bool {
+    /// Open `request_user_input` (a real question for the user) and open
+    /// `wait` cell calls (background-command polling = running, not waiting).
+    private static func hasOpenRequestUserInput(_ file: URL) -> (question: Bool, runningWait: Bool) {
         FileResultCache.shared.value(for: file, namespace: "codex_question") {
-            guard let handle = try? FileHandle(forReadingFrom: file) else { return false }
+            guard let handle = try? FileHandle(forReadingFrom: file) else { return (false, false) }
             defer { try? handle.close() }
             let size = Int64((try? handle.seekToEnd()) ?? 0)
             let readStart = max(0, size - 262_144)
             try? handle.seek(toOffset: UInt64(readStart))
-            guard let data = try? handle.readToEnd(), !data.isEmpty else { return false }
+            guard let data = try? handle.readToEnd(), !data.isEmpty else { return (false, false) }
 
             let marker = Data("request_user_input".utf8)
-            guard data.range(of: marker) != nil else { return false }
+            let waitMarker = Data("\"name\":\"wait\"".utf8)
+            guard data.range(of: marker) != nil || data.range(of: waitMarker) != nil else {
+                return (false, false)
+            }
 
             let outputMarker = Data("\"type\":\"function_call_output\"".utf8)
             let taskEventMarker = Data("\"type\":\"task_".utf8)
 
             var pendingCallIDs: Set<String> = []
+            var pendingWaitIDs: Set<String> = []
             for line in data.split(separator: 0x0A) {
                 guard line.range(of: marker) != nil
+                        || line.range(of: waitMarker) != nil
                         || line.range(of: outputMarker) != nil
                         || line.range(of: taskEventMarker) != nil else { continue }
                 guard let object = try? JSONSerialization.jsonObject(with: Data(line)),
@@ -513,6 +638,7 @@ enum WaitingDetector {
                    let eventType = payload["type"] as? String,
                    ["task_started", "task_complete", "turn_aborted", "thread_rolled_back"].contains(eventType) {
                     pendingCallIDs.removeAll()
+                    pendingWaitIDs.removeAll()
                     continue
                 }
 
@@ -522,11 +648,14 @@ enum WaitingDetector {
 
                 if itemType == "function_call", payload["name"] as? String == "request_user_input" {
                     pendingCallIDs.insert(callID)
+                } else if itemType == "function_call", payload["name"] as? String == "wait" {
+                    pendingWaitIDs.insert(callID)
                 } else if itemType == "function_call_output" {
                     pendingCallIDs.remove(callID)
+                    pendingWaitIDs.remove(callID)
                 }
             }
-            return !pendingCallIDs.isEmpty
+            return (!pendingCallIDs.isEmpty, !pendingWaitIDs.isEmpty)
         }
     }
 
@@ -539,9 +668,14 @@ enum WaitingDetector {
             try? handle.seek(toOffset: UInt64(readStart))
             guard let data = try? handle.readToEnd(), !data.isEmpty else { return false }
 
-            // Fast reject if no permission-like token
-            let lower = String(data: data, encoding: .utf8)?.lowercased() ?? ""
-            guard lower.contains("permission") || lower.contains("approval") || lower.contains("apply_patch") else { return false }
+            // Fast reject if no permission-like token. NOTE: `apply_patch`
+            // is deliberately NOT here: per codex's own protocol it is a
+            // normal edit tool (Edit/Write), not an approval request.
+            // Treating it as permission flagged every patch application
+            // as "等你授权" while it was running.
+            let text = String(data: data, encoding: .utf8) ?? ""
+            let lower = text.lowercased()
+            guard lower.contains("permission") || lower.contains("approval") else { return false }
 
             let outputMarker = Data("\"type\":\"function_call_output\"".utf8)
             let taskEventMarker = Data("\"type\":\"task_".utf8)
@@ -550,7 +684,7 @@ enum WaitingDetector {
             for line in data.split(separator: 0x0A) {
                 // keep lines that could be permission-related
                 let lineLower = String(data: Data(line), encoding: .utf8)?.lowercased() ?? ""
-                let isPermLine = lineLower.contains("permission") || lineLower.contains("approval") || lineLower.contains("apply_patch")
+                let isPermLine = lineLower.contains("permission") || lineLower.contains("approval")
                 guard isPermLine || line.range(of: outputMarker) != nil || line.range(of: taskEventMarker) != nil else { continue }
                 guard let object = try? JSONSerialization.jsonObject(with: Data(line)),
                       let envelope = object as? [String: Any],
@@ -569,7 +703,7 @@ enum WaitingDetector {
 
                 if itemType == "function_call", let name = payload["name"] as? String {
                     let n = name.lowercased()
-                    if n.contains("permission") || n.contains("approval") || n == "apply_patch" || n.contains("apply_patch") {
+                    if n.contains("permission") || n.contains("approval") {
                         pendingCallIDs.insert(callID)
                     }
                 } else if itemType == "function_call_output" {
@@ -577,9 +711,19 @@ enum WaitingDetector {
                 }
             }
             if !pendingCallIDs.isEmpty { return true }
-            // Also detect explicit pending approval state markers without call_id pairing
-            // e.g. codex may write a plain approval request object that stays open until answered
-            return lower.contains("\"approval\"") && lower.contains("\"pending\"")
+            // Last resort: an explicit pending-approval STATE marker on a
+            // single line (e.g. "status":"pending_approval"). Same-line only:
+            // "approval" and "pending" pages apart is usually code or docs
+            // being edited, not a prompt for the user.
+            for line in text.split(separator: "\n") {
+                let l = line.lowercased()
+                guard l.contains("approval") && l.contains("pending") else { continue }
+                if l.contains("\"status\"") || l.contains("\"state\"")
+                    || l.contains("pending_approval") || l.contains("pending approval") {
+                    return true
+                }
+            }
+            return false
         }
     }
 
@@ -726,12 +870,15 @@ enum WaitingDetector {
 
     // Shell-executor spans stay open for the whole lifetime of a terminal
     // command. One still open means a command is running, not a stall.
-    private static let terminalSpanNames = [
-        "LazyTerminalExecutor.execute",
-        "LocalShellStreamExecutor.execute",
-        "ShellCoreExecutor.execute",
-        "ZshState.execute",
-    ]
+    // Matched by pattern (not an allowlist): observed names include
+    // LazyTerminal/LocalShellStream/ShellCore/LocalBackgroundShell executors,
+    // and future renames keep working as long as they say shell/terminal.
+    private static func isTerminalSpan(name: String) -> Bool {
+        if name == "ZshState.execute" { return true }
+        let n = name.lowercased()
+        return n.contains("executor")
+            && (n.contains("shell") || n.contains("terminal") || n.contains("pty"))
+    }
 
     private static func tailIndicatesStall(_ url: URL) -> Bool {
         FileResultCache.shared.value(for: url, namespace: "cursor_stall") {
@@ -746,7 +893,9 @@ enum WaitingDetector {
             var openTerminalSpans: Set<String> = []
             for line in text.split(separator: "\n") {
                 guard line.contains("span_"),
-                      terminalSpanNames.contains(where: { line.contains("name=\"\($0)\"") }),
+                      let nameRange = line.range(of: "name=\""),
+                      let nameEnd = line[nameRange.upperBound...].firstIndex(of: "\""),
+                      isTerminalSpan(name: String(line[nameRange.upperBound..<nameEnd])),
                       let sidRange = line.range(of: "spanId=") else { continue }
                 let sid = line[sidRange.upperBound...].prefix(while: { $0 != " " })
                 if line.contains("span_started") {

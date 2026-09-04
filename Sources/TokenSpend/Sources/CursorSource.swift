@@ -120,10 +120,15 @@ enum CursorSource {
         do {
             try await syncEvents(cookie: cookie, store: store)
             // Quota summary is best-effort: its failure must not fail the sync.
+            // Network errors are ignored; store write errors are logged.
             if let summary = try? await fetchUsageSummary(cookie: cookie) {
-                persistQuotaSummary(summary, store: store)
+                do {
+                    try persistQuotaSummary(summary, store: store)
+                } catch {
+                    Diagnostics.recordStoreError(error, context: "cursor.persistQuota")
+                }
             }
-            store.setMeta("cursor_last_sync", String(Date().timeIntervalSince1970))
+            try store.setMeta(StoreKeys.cursorLastSync, String(Date().timeIntervalSince1970))
             let state = CursorAuthState.ok(cookieExpiry: expiry)
             lastAuthState = state
             return state
@@ -148,10 +153,10 @@ enum CursorSource {
         return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
     }
 
-    private static func persistQuotaSummary(_ json: [String: Any], store: UsageStore) {
+    private static func persistQuotaSummary(_ json: [String: Any], store: UsageStore) throws {
         guard let data = try? JSONSerialization.data(withJSONObject: json),
               let raw = String(data: data, encoding: .utf8), !raw.isEmpty else { return }
-        store.setMeta("cursor_quota", raw)
+        try store.setMeta(StoreKeys.cursorQuota, raw)
     }
 
     static var lastAuthState: CursorAuthState = .unknown
@@ -177,8 +182,15 @@ enum CursorSource {
             cachedExpiry = currentCookieExpiry
             return (fresh, currentCookieExpiry)
         } catch {
+            // Never silently mask revocation/expiry: a stale cache is only
+            // reused for transient failures while it is still comfortably
+            // valid. The underlying error is always logged.
+            Diagnostics.recordStoreError(error, context: "cursor.cookieExtract")
             if let cached = cachedCookie {
-                return (cached, cachedExpiry)
+                let usable = cachedExpiry.map { $0 > Date().addingTimeInterval(6 * 3600) } ?? false
+                if usable {
+                    return (cached, cachedExpiry)
+                }
             }
             throw error
         }
@@ -201,18 +213,18 @@ enum CursorSource {
         case badResponse
     }
 
-    private static func migrateKeysIfNeeded(store: UsageStore) {
-        guard store.meta("cursor_key_v2") != "1" else { return }
-        store.deleteAll(source: .cursor)
-        store.setMeta("cursor_last_ts", "")
-        store.setMeta("cursor_key_v2", "1")
+    private static func migrateKeysIfNeeded(store: UsageStore) throws {
+        guard store.meta(StoreKeys.cursorKeyV2) != "1" else { return }
+        try store.deleteAll(source: .cursor)
+        try store.setMeta(StoreKeys.cursorLastTs, "")
+        try store.setMeta(StoreKeys.cursorKeyV2, "1")
     }
 
     private static func syncEvents(cookie: String, store: UsageStore) async throws {
-        migrateKeysIfNeeded(store: store)
+        try migrateKeysIfNeeded(store: store)
 
         let now = Date()
-        var existing = store.meta("cursor_last_ts").flatMap { Double($0) } ?? 0
+        var existing = store.meta(StoreKeys.cursorLastTs).flatMap { Double($0) } ?? 0
         let incremental = existing > 0
         var startMs: Double
         var pageLimit: Int
@@ -229,7 +241,7 @@ enum CursorSource {
         var total = Int.max
         var maxTs: Double = existing
         var previousPageMinTs: Double = 0
-        var storedAccount = store.meta("cursor_account_id") ?? ""
+        var storedAccount = store.meta(StoreKeys.cursorAccountId) ?? ""
         var detectedAccount: String?
         var didSwitchAccount = false
 
@@ -253,6 +265,8 @@ enum CursorSource {
             var pageMinTs = Double.greatestFiniteMagnitude
             var pageMaxTs: Double = 0
             var pageOwningUser: String?
+            var pageEntries: [ContribEntry] = []
+            pageEntries.reserveCapacity(events.count)
 
             for event in events {
                 guard let tsStr = event["timestamp"] as? String, let ts = Double(tsStr) else { continue }
@@ -278,8 +292,12 @@ enum CursorSource {
                 let kind = event["kind"] as? String ?? ""
                 let key = eventKey(event, ts: ts, conv: conv, kind: kind)
                 let day = Fmt.day(Date(timeIntervalSince1970: ts / 1000))
-                store.upsert(source: .cursor, key: key, day: day, amount: amount)
+                pageEntries.append(ContribEntry(source: .cursor, key: key, day: day, amount: amount))
                 maxTs = max(maxTs, ts)
+            }
+            // One transaction per page: 200 rows per commit instead of 200 fsyncs.
+            if !pageEntries.isEmpty {
+                try store.batchUpsert(pageEntries)
             }
 
             if let u = pageOwningUser {
@@ -307,9 +325,9 @@ enum CursorSource {
             previousPageMinTs = pageMinTs == Double.greatestFiniteMagnitude ? 0 : pageMinTs
             page += 1
         }
-        store.setMeta("cursor_last_ts", String(maxTs))
+        try store.setMeta(StoreKeys.cursorLastTs, String(maxTs))
         if let account = detectedAccount, !account.isEmpty {
-            store.setMeta("cursor_account_id", account)
+            try store.setMeta(StoreKeys.cursorAccountId, account)
         }
     }
 
@@ -382,6 +400,7 @@ enum CursorSource {
     ]
 
     private static func extractSessionCookie() throws -> String {
+        sweepStaleTempDirs()
         var sawBrowser = false
         var sawV20 = false
         var sawKeychainDenied = false
@@ -451,10 +470,32 @@ enum CursorSource {
             }
     }
 
+    private static let tmpPrefix = "TokenSpend-Cookies-"
+
+    /// Remove our own temp cookie copies left behind by a past crash.
+    /// Only touches directories with our prefix, older than one hour.
+    private static func sweepStaleTempDirs() {
+        let tmp = FileManager.default.temporaryDirectory
+        guard let entries = try? FileManager.default.contentsOfDirectory(
+            at: tmp, includingPropertiesForKeys: [.contentModificationDateKey]
+        ) else { return }
+        for entry in entries where entry.lastPathComponent.hasPrefix(tmpPrefix) {
+            let mtime = (try? entry.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? Date()
+            if Date().timeIntervalSince(mtime) > 3600 {
+                try? FileManager.default.removeItem(at: entry)
+            }
+        }
+    }
+
     private static func readCookieValue(from dbURL: URL, service: String, account: String) throws -> String? {
-        let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        // Owner-only temp dir: the copy holds cookies for ALL sites.
+        // Named prefix lets a later launch sweep it if we crash mid-read.
+        let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent(tmpPrefix + UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: tmpDir) }
-        try FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(
+            at: tmpDir, withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
         let dst = tmpDir.appendingPathComponent("Cookies")
         try FileManager.default.copyItem(at: dbURL, to: dst)
         for ext in ["-wal", "-shm"] {

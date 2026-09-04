@@ -7,7 +7,7 @@ extension Tool {
         .cursor: Color(red: 0.72, green: 0.42, blue: 0.98),
     ]
 
-    var colorKey: String { "color_\(rawValue)" }
+    var colorKey: String { PrefKeys.color(for: self) }
 
     var color: Color { ToolColorCache.color(for: self) }
 }

@@ -22,9 +22,9 @@
 
 - **悬浮圆窗**：置顶、全 Space 显示、可拖动（位置记忆）、进度环显示当前周期流逝；遮挡时自动暂停动画
 - **实时活动指示**：哪个工具正在消耗，对应颜色的能量环弧段绕圆窗旋转（空闲零开销，可选 30/60fps）；详情行显示 `消耗中·Ns`。回合级完成检测，结束后 3 秒内熄灭
-- **等待检测**：agent 等待确认时圆窗变橙，单工具显示 `● 工具名`+`等你回答/等你确认`，多工具显示数量与彩色工具名；菜单栏图标同步变橙并带彩点。cursor 的终端长命令执行不再误报为等待
+- **等待检测**：agent 等待确认时圆窗变橙，单工具显示 `● 工具名`+`等你回答/等你确认`，多工具显示数量与彩色工具名；菜单栏图标同步变橙并带彩点。运行中命令不再误报为等待：opencode 授权看 asking 之后有无新进展（回答后继续跑会熄灭）、codex/cursor 的终端（含后台）执行期抑制、执行子进程存活时不报停滞；codex 的 `apply_patch` 按正常编辑处理不再当授权
 - **剩余额度**：
-  - codex：5h 窗口 / 周窗口各“剩 X%”+ 重置时间（解析 rollout 中 `rate_limits`，按 `limit_id` 家族分桶，兼容 Plus 账号单窗口形态）
+  - codex：短窗口（5h）/ 长窗口（周）各“剩 X%”+ 重置时间（解析 rollout 中 `rate_limits`，按 `limit_id` 家族分桶再按窗口时长归类；无 5h 的计划只显示周窗口）
   - cursor：月度 `included` 已用百分比、账期、自家模型池/三方模型池各自已用百分比（来自 `usage-summary`）
   - 三档显示：常驻在悬浮窗内（默认）/ 悬浮时显示 / 隐藏；详情面板与状态栏菜单始终有完整/摘要展示
 - **个性化**：偏好设置面板可改工具颜色（任意色，ColorPicker）与动画帧率（30 省电 / 60 流畅），实时生效、持久化；一键恢复默认颜色
@@ -93,6 +93,17 @@ rm key.pem cert.pem
 .build/debug/TokenSpend --print-waiting   # 当前等待状态
 .build/debug/TokenSpend --print-quota     # 本地额度快照（codex 剩% / cursor 已用%）
 .build/debug/TokenSpend --reconcile       # 手动对账清理
+.build/debug/TokenSpend --export-csv [path] # 按天分工具导出 CSV（不给 path 则打 stdout）
+```
+
+### 可选配置（均经 `defaults write com.peilin.tokenspend`）
+
+```bash
+# codex 费用估算（USD/1M tokens，codex 源本身不带费用，配了才显示）
+defaults write com.peilin.tokenspend price_input_per_1m -float 1.5
+defaults write com.peilin.tokenspend price_output_per_1m -float 6
+# 额度告警（默认关；codex 周/5h 剩 <20% 或 cursor 月已用 >80% 时每天提醒一次）
+defaults write com.peilin.tokenspend quota_alert_enabled -bool true
 ```
 
 ## 刷新策略
@@ -101,7 +112,7 @@ rm key.pem cert.pem
 |---|---|---|
 | opencode/codex 增量 | 30s + 3s 轮询 | 偏移量增量；文件变更立刻点亮活动环；codex 额度随增量落盘 |
 | 活动保持/熄灭 | 回合级 | opencode/codex 回合结束 3s 内熄灭；cursor 活跃期 3s |
-| 等待检测 | 2s | opencode question / codex request_user_input / cursor 提问或停滞（终端执行期抑制） |
+| 等待检测 | 2s | opencode question / codex request_user_input / cursor 提问或停滞（终端执行期抑制；授权提示后有新进展视为已回答；执行子进程存活不报停滞） |
 | cursor 用量事件 | 8s（活跃）/ 300s（空闲） | 指数退避至 60min |
 | cursor 额度 | 随用量事件刷新 | `usage-summary` 复用同一 cookie，失败不影响用量同步 |
 | 详情汇总重算 | 按需 | UsageStore 版本号脏检查，未变化跳过 SQL；至少 60s 刷新一次进度环/跨天 |
@@ -118,7 +129,7 @@ rm key.pem cert.pem
 
 - cursor 统计依赖官网接口（非官方逆向），若失效需适配；`v20` cookie 需改用 Cursor 应用
 - cursor 初次同步回溯 400 天，更早无法获取；官网落账有滞后
-- codex 额度仅在 codex 发起请求后刷新（来自响应头的 `rate_limits`）；Plus 账号可能出现周窗口单窗口形态
+- codex 额度仅在 codex 发起请求后刷新（来自响应头的 `rate_limits`）；窗口按时长自适应归类（短/长），迟到的旧形状事件不会覆盖新窗口，计划取消某窗口后旧值过期自动消失
 - codex 5h 窗口重置显示短窗口用时刻、长窗口用日期（由 `window_minutes` 决定）
 - 圆窗不显示每分钟速率（`+xx/m` 已取消）
 

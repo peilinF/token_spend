@@ -2,6 +2,7 @@ import AppKit
 import Foundation
 import Combine
 import SwiftUI
+import UserNotifications
 
 @MainActor
 final class AppState: ObservableObject {
@@ -9,14 +10,14 @@ final class AppState: ObservableObject {
 
     @Published var period: Period {
         didSet {
-            UserDefaults.standard.set(period.rawValue, forKey: "period")
+            UserDefaults.standard.set(period.rawValue, forKey: PrefKeys.period)
             lastSummaryVersion = -1
             recompute()
         }
     }
     @Published var mode: UsageMode {
         didSet {
-            UserDefaults.standard.set(mode.rawValue, forKey: "mode")
+            UserDefaults.standard.set(mode.rawValue, forKey: PrefKeys.mode)
             lastSummaryVersion = -1
             recompute()
         }
@@ -25,6 +26,9 @@ final class AppState: ObservableObject {
     @Published private(set) var cursorAuth: CursorAuthState = CursorSource.lastAuthState
     @Published private(set) var lastUpdated: Date?
     @Published private(set) var cursorLastSync: Date?
+    /// Last local-store failure (SQLite write). Shown in DetailView footer;
+    /// nil means healthy. Distinct from cursor network/auth state.
+    @Published private(set) var storeError: String?
     // Do not add liveRates / +xx/m. Product decision: no per-minute token rate.
     @Published private(set) var activeTools: Set<Tool> = []
     @Published private(set) var activeSince: [Tool: Date] = [:]
@@ -40,24 +44,24 @@ final class AppState: ObservableObject {
                 widgetScale = clamped
                 return
             }
-            UserDefaults.standard.set(clamped, forKey: "widget_scale")
+            UserDefaults.standard.set(clamped, forKey: PrefKeys.widgetScale)
         }
     }
     @Published var quotaDisplayMode: QuotaDisplayMode {
-        didSet { UserDefaults.standard.set(quotaDisplayMode.rawValue, forKey: "quota_display") }
+        didSet { UserDefaults.standard.set(quotaDisplayMode.rawValue, forKey: PrefKeys.quotaDisplay) }
     }
     @Published var animationFPS: Int {
-        didSet { UserDefaults.standard.set(animationFPS, forKey: "animation_fps") }
+        didSet { UserDefaults.standard.set(animationFPS, forKey: PrefKeys.animationFPS) }
     }
 
     var waitThreshold: TimeInterval {
-        get { UserDefaults.standard.object(forKey: "wait_threshold") as? TimeInterval ?? 60 }
-        set { UserDefaults.standard.set(newValue, forKey: "wait_threshold") }
+        get { UserDefaults.standard.object(forKey: PrefKeys.waitThreshold) as? TimeInterval ?? 60 }
+        set { UserDefaults.standard.set(newValue, forKey: PrefKeys.waitThreshold) }
     }
 
     var cursorActiveInterval: TimeInterval {
-        get { UserDefaults.standard.object(forKey: "cursor_active_interval") as? TimeInterval ?? 8 }
-        set { UserDefaults.standard.set(newValue, forKey: "cursor_active_interval") }
+        get { UserDefaults.standard.object(forKey: PrefKeys.cursorActiveInterval) as? TimeInterval ?? 8 }
+        set { UserDefaults.standard.set(newValue, forKey: PrefKeys.cursorActiveInterval) }
     }
 
     func toolColor(_ tool: Tool) -> Color { toolColors[tool] ?? tool.color }
@@ -95,6 +99,35 @@ final class AppState: ObservableObject {
             let quota = CursorQuota.decode(fromJSON: cursorRaw)
             if quota != cursorQuota { cursorQuota = quota }
         }
+        checkQuotaAlert()
+    }
+
+    /// Opt-in daily quota alert (default off; enable with
+    /// `defaults write com.peilin.tokenspend quota_alert_enabled -bool true`).
+    /// Fires at most once per day when codex weekly/5h quota drops below 20%
+    /// or cursor monthly usage tops 80%.
+    private func checkQuotaAlert() {
+        guard UserDefaults.standard.bool(forKey: PrefKeys.quotaAlertEnabled) else { return }
+        let today = Fmt.day(Date())
+        guard UserDefaults.standard.string(forKey: PrefKeys.quotaAlertDay) != today else { return }
+        var body: String?
+        if let secondary = codexQuota?.secondary, secondary.leftPercent < 20 {
+            body = "codex \(secondary.shortLabel)额度仅剩 \(Int(secondary.leftPercent))%"
+        } else if let primary = codexQuota?.primary, primary.leftPercent < 20 {
+            body = "codex \(primary.shortLabel)额度仅剩 \(Int(primary.leftPercent))%"
+        } else if let used = cursorQuota?.totalPercentUsed, used > 80 {
+            body = "cursor 月度已用 \(Int(used))%"
+        }
+        guard let message = body else { return }
+        UserDefaults.standard.set(today, forKey: PrefKeys.quotaAlertDay)
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { granted, _ in
+            guard granted else { return }
+            let content = UNMutableNotificationContent()
+            content.title = "TokenSpend 额度提醒"
+            content.body = message
+            let request = UNNotificationRequest(identifier: "tokenspend-quota", content: content, trigger: nil)
+            UNUserNotificationCenter.current().add(request)
+        }
     }
 
     private let store = UsageStore.shared
@@ -118,46 +151,56 @@ final class AppState: ObservableObject {
     private var cursorNextAttempt = Date.distantPast
     private var lastCursorRefresh = Date.distantPast
     private var isRefreshingCursor = false
+    private var cursorRefreshStart = Date.distantPast
     private var lastWakeRefresh = Date.distantPast
 
     init() {
-        period = Period(rawValue: UserDefaults.standard.string(forKey: "period") ?? "") ?? .day
-        mode = UsageMode(rawValue: UserDefaults.standard.string(forKey: "mode") ?? "") ?? .full
-        let scale = UserDefaults.standard.object(forKey: "widget_scale") as? Double ?? 1.0
+        period = Period(rawValue: UserDefaults.standard.string(forKey: PrefKeys.period) ?? "") ?? .day
+        mode = UsageMode(rawValue: UserDefaults.standard.string(forKey: PrefKeys.mode) ?? "") ?? .full
+        let scale = UserDefaults.standard.object(forKey: PrefKeys.widgetScale) as? Double ?? 1.0
         widgetScale = min(2.5, max(1.0, scale))
-        quotaDisplayMode = QuotaDisplayMode(rawValue: UserDefaults.standard.string(forKey: "quota_display") ?? "") ?? .always
-        animationFPS = UserDefaults.standard.object(forKey: "animation_fps") as? Int ?? 30
+        quotaDisplayMode = QuotaDisplayMode(rawValue: UserDefaults.standard.string(forKey: PrefKeys.quotaDisplay) ?? "") ?? .always
+        animationFPS = UserDefaults.standard.object(forKey: PrefKeys.animationFPS) as? Int ?? 30
         let colors = ToolColorCache.loadAll()
         ToolColorCache.replace(colors)
         toolColors = colors
-        if let raw = store.meta("cursor_last_sync"), let ts = Double(raw) {
+        if let raw = store.meta(StoreKeys.cursorLastSync), let ts = Double(raw) {
             cursorLastSync = Date(timeIntervalSince1970: ts)
         }
         recompute()
     }
 
+    private func makeTimer(interval: TimeInterval, tolerance: TimeInterval, block: @escaping () -> Void) -> Timer {
+        let timer = Timer(timeInterval: interval, repeats: true) { _ in block() }
+        timer.tolerance = tolerance
+        RunLoop.main.add(timer, forMode: .common)
+        return timer
+    }
+
     func startEngine() {
-        localTimer?.invalidate()
-        cursorTimer?.invalidate()
-        liveTimer?.invalidate()
-        waitTimer?.invalidate()
-        reconcileTimer?.invalidate()
-        localTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { _ in
+        for timer in [localTimer, cursorTimer, liveTimer, waitTimer, reconcileTimer, expiryTimer] {
+            timer?.invalidate()
+        }
+        // All timers live in .common modes (firing survives drag/scroll) and
+        // carry tolerance so the system can coalesce wakeups (App Nap power).
+        localTimer = makeTimer(interval: 30, tolerance: 5) {
             Task { await AppState.shared.refreshLocal() }
         }
-        cursorTimer = Timer.scheduledTimer(withTimeInterval: 300, repeats: true) { _ in
+        cursorTimer = makeTimer(interval: 300, tolerance: 30) {
             Task { await AppState.shared.refreshCursor() }
         }
-        liveTimer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { _ in
+        liveTimer = makeTimer(interval: 3, tolerance: 0.5) {
             Task { await AppState.shared.pollLive() }
         }
-        waitTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { _ in
+        waitTimer = makeTimer(interval: 2, tolerance: 0.5) {
             Task { await AppState.shared.pollWaiting() }
         }
-        reconcileTimer = Timer.scheduledTimer(withTimeInterval: 3600, repeats: true) { _ in
+        reconcileTimer = makeTimer(interval: 3600, tolerance: 300) {
             Task { await AppState.shared.runReconcile() }
         }
-        expiryTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { _ in
+        // 1s granularity is plenty: quietTimeout is 14s and the arc UI
+        // updates at second precision ("消耗中·Ns").
+        expiryTimer = makeTimer(interval: 1, tolerance: 0.25) {
             MainActor.assumeIsolated {
                 AppState.shared.recomputeActiveTools()
             }
@@ -200,12 +243,19 @@ final class AppState: ObservableObject {
 
     func runReconcile() async {
         let store = self.store
-        await Task.detached(priority: .utility) {
-            autoreleasepool {
-                OpenCodeSource.reconcile(store: store)
-                CodexSource.reconcile(store: store)
-            }
-        }.value
+        do {
+            try await Task.detached(priority: .utility) {
+                try OpenCodeSource.reconcile(store: store)
+                try CodexSource.reconcile(store: store)
+                // Retention: drop per-day rows older than 400 days so the
+                // yearly view stays bounded. Sources re-add live days.
+                if let cutoff = Calendar.current.date(byAdding: .day, value: -400, to: Date()) {
+                    try store.prune(olderThanDay: Fmt.day(cutoff))
+                }
+            }.value
+        } catch {
+            noteStoreError(error, context: "reconcile")
+        }
         recompute()
     }
 
@@ -221,12 +271,17 @@ final class AppState: ObservableObject {
 
     private func refreshLocalSources(overlapMS: Int64) async {
         let store = self.store
-        await Task.detached(priority: .utility) {
-            autoreleasepool {
-                try? OpenCodeSource.refresh(store: store, overlapMS: overlapMS)
-                try? CodexSource.refresh(store: store)
-            }
-        }.value
+        do {
+            try await Task.detached(priority: .utility) {
+                try OpenCodeSource.refresh(store: store, overlapMS: overlapMS)
+                try CodexSource.refresh(store: store)
+            }.value
+            clearStoreError()
+        } catch let e as SQLiteError {
+            noteStoreError(e, context: "refreshLocal")
+        } catch {
+            noteStoreError(error, context: "refreshLocal")
+        }
         recompute()
     }
 
@@ -295,11 +350,18 @@ final class AppState: ObservableObject {
 
     func refreshCursor(force: Bool = false) async {
         if !force && Date() < cursorNextAttempt { return }
-        if isRefreshingCursor && !force { return }
+        // A hung network call must not wedge sync forever: a flag older than
+        // 120s is treated as stale and a new attempt is allowed through.
+        if isRefreshingCursor {
+            if !force, Date().timeIntervalSince(cursorRefreshStart) < 120 { return }
+            Diagnostics.debug("cursor refresh flag stale, retrying")
+        }
         isRefreshingCursor = true
+        cursorRefreshStart = Date()
         lastCursorRefresh = Date()
         defer { isRefreshingCursor = false }
 
+        let started = Date()
         let store = self.store
         do {
             let state = try await Task.detached(priority: .utility) {
@@ -309,6 +371,7 @@ final class AppState: ObservableObject {
             cursorLastSync = Date()
             cursorFailures = 0
             cursorNextAttempt = .distantPast
+            Diagnostics.debug(String(format: "cursor refresh ok %.1fs", Date().timeIntervalSince(started)))
         } catch KeychainError.denied {
             cursorAuth = .keychainDenied
             applyCursorBackoff(seconds: 1800)
@@ -321,7 +384,19 @@ final class AppState: ObservableObject {
         } catch CursorSource.CursorAPIError.unsupportedCookie {
             cursorAuth = .unsupportedCookie
             applyCursorBackoff(seconds: 900)
+        } catch let e as CursorSource.CursorAPIError {
+            // HTTP / protocol errors: log the status, back off, don't touch
+            // the store-error banner.
+            Diagnostics.debug("cursor refresh failed in \(String(format: "%.1f", Date().timeIntervalSince(started)))s: \(e)")
+            cursorFailures += 1
+            cursorAuth = .error("网络错误，\(Int(min(300 * pow(2, Double(cursorFailures - 1)), 3600)) / 60) 分钟后重试")
+            applyCursorBackoff(seconds: min(300 * pow(2, Double(cursorFailures - 1)), 3600))
+        } catch let e as SQLiteError {
+            // Local store broken: surface in footer, don't masquerade as
+            // a network error with exponential backoff.
+            noteStoreError(e, context: "refreshCursor")
         } catch {
+            Diagnostics.debug("cursor refresh failed in \(String(format: "%.1f", Date().timeIntervalSince(started)))s: \(error)")
             cursorFailures += 1
             cursorAuth = .error("网络错误，\(Int(min(300 * pow(2, Double(cursorFailures - 1)), 3600)) / 60) 分钟后重试")
             applyCursorBackoff(seconds: min(300 * pow(2, Double(cursorFailures - 1)), 3600))
@@ -348,6 +423,17 @@ final class AppState: ObservableObject {
 
     private func applyCursorBackoff(seconds: TimeInterval) {
         cursorNextAttempt = Date().addingTimeInterval(seconds)
+    }
+
+    /// Record a local-store failure: log it and expose it to the UI footer.
+    /// Success paths call `clearStoreError()` so the banner disappears.
+    func noteStoreError(_ error: Error, context: String) {
+        Diagnostics.recordStoreError(error, context: context)
+        storeError = "\(context): \(error)"
+    }
+
+    func clearStoreError() {
+        if storeError != nil { storeError = nil }
     }
 
     private var lastSummaryVersion = -1
@@ -392,8 +478,8 @@ final class AppState: ObservableObject {
     nonisolated private static func buildSnapshot(store: UsageStore, period: Period, now: Date) -> SummarySnapshot {
         let range = PeriodMath.range(of: period, now: now)
         let calendar = Calendar.current
-        let codexRaw = store.meta("codex_rate_limits")
-        let cursorRaw = store.meta("cursor_quota")
+        let codexRaw = store.meta(StoreKeys.codexRateLimits)
+        let cursorRaw = store.meta(StoreKeys.cursorQuota)
 
         guard var cursor = calendar.dateComponents([.day], from: range.start, to: now).day, cursor >= 0 else {
             return SummarySnapshot(summary: nil, codexRaw: codexRaw, cursorRaw: cursorRaw)
@@ -409,7 +495,8 @@ final class AppState: ObservableObject {
             let key = Fmt.day(date)
             var amounts: [Tool: UsageAmount] = [:]
             for tool in Tool.allCases {
-                let amount = totals[tool]?[key] ?? .zero
+                var amount = totals[tool]?[key] ?? .zero
+                if tool == .codex { amount = Pricing.codexEstimate(for: amount) }
                 amounts[tool] = amount
                 perToolAmounts[tool, default: .zero] = perToolAmounts[tool, default: .zero] + amount
             }

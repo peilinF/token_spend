@@ -4,7 +4,58 @@ import Foundation
 
 enum Diagnostics {
     static var isEnabled: Bool {
-        UserDefaults.standard.bool(forKey: "diag_enabled")
+        UserDefaults.standard.bool(forKey: PrefKeys.diagEnabled)
+    }
+
+    /// Last store/IO failure, kept in memory for the UI health banner.
+    /// Always recorded (even when diag file logging is off).
+    private static let stateLock = NSLock()
+    private static var _storeErrorCount = 0
+    private static var _lastStoreError: String?
+    private static var _lastStoreErrorAt: Date?
+
+    static var storeErrorCount: Int {
+        stateLock.lock(); defer { stateLock.unlock() }
+        return _storeErrorCount
+    }
+    static var lastStoreError: String? {
+        stateLock.lock(); defer { stateLock.unlock() }
+        return _lastStoreError
+    }
+    static var lastStoreErrorAt: Date? {
+        stateLock.lock(); defer { stateLock.unlock() }
+        return _lastStoreErrorAt
+    }
+
+    /// Record a store/DB/IO failure. Always NSLog'd; appended to diag.log
+    /// only when diagnostics are enabled to avoid disk churn.
+    static func recordStoreError(_ error: Error, context: String) {
+        let message = "\(context): \(error)"
+        stateLock.lock()
+        _storeErrorCount += 1
+        _lastStoreError = message
+        _lastStoreErrorAt = Date()
+        stateLock.unlock()
+        NSLog("TokenSpend store error: \(message)")
+        if isEnabled {
+            append("store_error \(message)")
+        }
+    }
+
+    static func recordEvent(_ line: String) {
+        NSLog("TokenSpend \(line)")
+        if isEnabled {
+            append(line)
+        }
+    }
+
+    /// Low-volume debug detail (HTTP statuses, backoff, timings). Written
+    /// only when diagnostics are enabled; never NSLog'd to avoid console
+    /// spam on the 8s active-poll cadence.
+    static func debug(_ line: String) {
+        if isEnabled {
+            append(line)
+        }
     }
 
     static var logURL: URL {

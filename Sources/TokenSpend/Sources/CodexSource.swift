@@ -47,14 +47,14 @@ enum CodexSource {
         }
     }
 
-    static func reconcile(store: UsageStore) {
+    static func reconcile(store: UsageStore) throws {
         listLock.lock()
         listAt = .distantPast
         listLock.unlock()
         let sessionsDir = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".codex/sessions")
         guard FileManager.default.fileExists(atPath: sessionsDir.path) else {
-            store.deleteSourceKeysNotIn(source: .codex, validKeys: [])
+            try store.deleteSourceKeysNotIn(source: .codex, validKeys: [])
             return
         }
         let paths = Set(sessionFiles().map(\.url.path))
@@ -66,7 +66,7 @@ enum CodexSource {
                 valid.insert(key)
             }
         }
-        store.deleteSourceKeysNotIn(source: .codex, validKeys: valid)
+        try store.deleteSourceKeysNotIn(source: .codex, validKeys: valid)
     }
 
     private static let listLock = NSLock()
@@ -107,15 +107,27 @@ enum CodexSource {
             let attrs = (try? FileManager.default.attributesOfItem(atPath: file.path)) ?? [:]
             let mtime = (attrs[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
             let size = (attrs[.size] as? NSNumber)?.int64Value ?? 0
-            let sig = "\(mtime)|\(size)"
-            let sigKey = "codex_sig:" + file.path
-            let offKey = "codex_off:" + file.path
+            let inode = (attrs[.systemFileNumber] as? NSNumber)?.int64Value ?? 0
+            // inode disambiguates same-size in-place rewrites; mtime-only
+            // bumps with identical size+offset are touches, not new data.
+            let sig = "\(inode)|\(mtime)|\(size)"
+            let sigKey = StoreKeys.codexSig(file.path)
+            let offKey = StoreKeys.codexOff(file.path)
             if store.meta(sigKey) == sig { continue }
+            let prevSig = store.meta(sigKey)
+            let prevInode = prevSig?.split(separator: "|").first.map(String.init)
 
             var startOffset = Int64(store.meta(offKey) ?? "0") ?? 0
-            if startOffset > size || startOffset < 0 {
-                store.deleteSourceKeys(source: .codex, keyPrefix: file.path + "|")
+            if startOffset > size || startOffset < 0 || (prevInode != nil && prevInode != String(inode)) {
+                // Truncated, rotated or replaced: old per-day aggregates are
+                // invalid, clear and rescan from zero.
+                try store.deleteSourceKeys(source: .codex, keyPrefix: file.path + "|")
                 startOffset = 0
+            } else if startOffset == size, size > 0 {
+                // Same size, same file, offset at EOF: mtime touch, no new
+                // data. Just record the signature and skip the parse.
+                try store.setMeta(sigKey, sig)
+                continue
             }
 
             let (chunk, newOffset, rateLimits) = parseChunk(file, from: startOffset)
@@ -124,7 +136,7 @@ enum CodexSource {
             }
 
             if startOffset == 0 {
-                store.deleteSourceKeys(source: .codex, keyPrefix: file.path + "|")
+                try store.deleteSourceKeys(source: .codex, keyPrefix: file.path + "|")
             }
             if !chunk.isEmpty {
                 var merged: [String: UsageAmount] = [:]
@@ -135,19 +147,31 @@ enum CodexSource {
                 for (day, delta) in chunk {
                     merged[day, default: .zero] = merged[day, default: .zero] + delta
                 }
-                for (day, amount) in merged {
-                    store.upsert(source: .codex, key: file.path + "|" + day, day: day, amount: amount)
-                }
+                // One transaction per file instead of one fsync per day-row.
+                try store.batchUpsert(merged.map { day, amount in
+                    ContribEntry(source: .codex, key: file.path + "|" + day, day: day, amount: amount)
+                })
             }
-            store.setMeta(offKey, String(newOffset))
-            store.setMeta(sigKey, sig)
+            try store.setMeta(offKey, String(newOffset))
+            try store.setMeta(sigKey, sig)
         }
         if let best {
-            persistRateLimits(best.json, store: store)
+            try persistRateLimits(best.json, observedTs: best.ts, store: store)
         }
-        if !hasUsableRateLimits(store) {
-            primeRateLimits(store: store)
+        if !hasUsableRateLimits(store) || hasLegacyRateRecords(store) {
+            try primeRateLimits(store: store)
         }
+    }
+
+    /// One-time adoption: pre-merge stored payloads lack `observed_ts`/slots.
+    /// A single tail scan converts them to merged records (heals the missing
+    /// 5h window immediately instead of waiting for the next codex request).
+    private static func hasLegacyRateRecords(_ store: UsageStore) -> Bool {
+        guard let raw = store.meta(StoreKeys.codexRateLimits),
+              let data = raw.data(using: .utf8),
+              let map = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return false }
+        if map["limit_id"] != nil || map["used_percent"] != nil { return true }
+        return map.values.contains { ($0 as? [String: Any])?["observed_ts"] == nil }
     }
 
     // Rate-limit snapshots ride along on token_count events; primary is the
@@ -164,9 +188,10 @@ enum CodexSource {
     private static let primeLock = NSLock()
     private static var lastPrimeAt = Date.distantPast
 
-    private static func persistRateLimits(_ json: [String: Any], store: UsageStore) {
-        // Keep one snapshot per limit family; the UI picks the main one.
-        let existingRaw = store.meta("codex_rate_limits")
+    private static func persistRateLimits(_ json: [String: Any], observedTs: Double, store: UsageStore) throws {
+        // One merged record per limit family; windows merge per kind so a
+        // late older-shaped event can't clobber a fresher window.
+        let existingRaw = store.meta(StoreKeys.codexRateLimits)
         var map: [String: Any] = [:]
         if let raw = existingRaw, let data = raw.data(using: .utf8),
            let existing = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
@@ -178,22 +203,24 @@ enum CodexSource {
             map = [legacyFamily: map]
         }
         let family = ((json["limit_id"] as? String) ?? "codex").lowercased()
-        if let current = map[family] as? [String: Any], (current as NSDictionary).isEqual(to: json) {
+        let stored = map[family] as? [String: Any] ?? [:]
+        let merged = CodexQuota.mergeRateSnapshot(stored: stored, with: json, observedTs: observedTs)
+        if (stored as NSDictionary).isEqual(to: merged) {
             return
         }
-        map[family] = json
+        map[family] = merged
         guard let data = try? JSONSerialization.data(withJSONObject: map),
               let raw = String(data: data, encoding: .utf8), raw != existingRaw else { return }
-        store.setMeta("codex_rate_limits", raw)
+        try store.setMeta(StoreKeys.codexRateLimits, raw)
     }
 
     private static func hasUsableRateLimits(_ store: UsageStore) -> Bool {
-        CodexQuota.decode(fromJSON: store.meta("codex_rate_limits")) != nil
+        CodexQuota.decode(fromJSON: store.meta(StoreKeys.codexRateLimits)) != nil
     }
 
     // First launch after this feature ships: no incremental lines may arrive
     // for a while, so pull recent snapshots straight from the newest tail.
-    private static func primeRateLimits(store: UsageStore) {
+    private static func primeRateLimits(store: UsageStore) throws {
         primeLock.lock()
         defer { primeLock.unlock() }
         guard Date().timeIntervalSince(lastPrimeAt) > 60 else { return }
@@ -205,16 +232,16 @@ enum CodexSource {
         try? handle.seek(toOffset: UInt64(max(0, size - 512_000)))
         guard let data = try? handle.readToEnd(),
               let text = String(data: data, encoding: .utf8) else { return }
-        var latestByFamily: [String: [String: Any]] = [:]
+        var latestByFamily: [String: (json: [String: Any], ts: Double)] = [:]
         for line in text.split(separator: "\n").reversed() {
             guard line.contains("token_count"), line.contains("rate_limits"),
                   let obj = parseLine(Data(line.utf8)),
                   let hit = extractRateLimits(obj) else { continue }
             let family = ((hit.json["limit_id"] as? String) ?? "codex").lowercased()
-            if latestByFamily[family] == nil { latestByFamily[family] = hit.json }
+            if latestByFamily[family] == nil { latestByFamily[family] = (hit.json, hit.ts) }
         }
         guard !latestByFamily.isEmpty else { return }
-        let existingRaw = store.meta("codex_rate_limits")
+        let existingRaw = store.meta(StoreKeys.codexRateLimits)
         var map: [String: Any] = [:]
         if let raw = existingRaw, let data = raw.data(using: .utf8),
            let existing = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
@@ -224,10 +251,16 @@ enum CodexSource {
             let legacyFamily = ((map["limit_id"] as? String) ?? "codex").lowercased()
             map = [legacyFamily: map]
         }
-        for (family, snapshot) in latestByFamily { map[family] = snapshot }
+        let now = Date().timeIntervalSince1970
+        for (family, hit) in latestByFamily {
+            let stored = map[family] as? [String: Any] ?? [:]
+            map[family] = CodexQuota.mergeRateSnapshot(
+                stored: stored, with: hit.json, observedTs: hit.ts > 0 ? hit.ts : now
+            )
+        }
         guard let out = try? JSONSerialization.data(withJSONObject: map),
               let raw = String(data: out, encoding: .utf8), raw != existingRaw else { return }
-        store.setMeta("codex_rate_limits", raw)
+        try store.setMeta(StoreKeys.codexRateLimits, raw)
     }
 
     private static func parseChunk(_ file: URL, from offset: Int64) -> ([String: UsageAmount], Int64, (json: [String: Any], ts: Double)?) {
@@ -240,6 +273,13 @@ enum CodexSource {
         }
         guard let data = try? handle.readToEnd(), !data.isEmpty else { return ([:], offset, nil) }
 
+        // Day fallback for lines without a parseable timestamp: the file's
+        // own mtime beats guessing from path segments, which misattributes
+        // history when the layout changes.
+        let fileDay: String = {
+            let mtime = (try? file.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? Date()
+            return Fmt.day(mtime)
+        }()
         var perDay: [String: UsageAmount] = [:]
         var latestRateLimits: (json: [String: Any], ts: Double)?
         var consumed = 0
@@ -250,17 +290,20 @@ enum CodexSource {
             guard lineData.count > 1 else { continue }
             autoreleasepool {
                 if let obj = parseLine(Data(lineData)) {
-                    apply(obj, file: file, into: &perDay)
+                    apply(obj, file: file, fileDay: fileDay, into: &perDay)
                     if let hit = extractRateLimits(obj), latestRateLimits == nil || hit.ts > latestRateLimits!.ts {
                         latestRateLimits = hit
                     }
                 }
             }
         }
+        // Bytes after the last newline form an incomplete line: the returned
+        // offset deliberately excludes them so the fragment is re-read (not
+        // lost, not double-counted) once the writer finishes the line.
         return (perDay, offset + Int64(consumed), latestRateLimits)
     }
 
-    private static func apply(_ obj: [String: Any], file: URL, into perDay: inout [String: UsageAmount]) {
+    private static func apply(_ obj: [String: Any], file: URL, fileDay: String, into perDay: inout [String: UsageAmount]) {
         guard let payload = obj["payload"] as? [String: Any],
               payload["type"] as? String == "token_count",
               let info = payload["info"] as? [String: Any],
@@ -275,7 +318,7 @@ enum CodexSource {
         if let ts = obj["timestamp"] as? String, let date = parseTimestamp(ts) {
             day = Fmt.day(date)
         } else {
-            day = fallbackDay(file)
+            day = fileDay
         }
         perDay[day, default: .zero] = perDay[day, default: .zero] + amount
     }
@@ -288,17 +331,6 @@ enum CodexSource {
         if let d = Formatters.isoFractional.date(from: s) { return d }
         if let d = Formatters.isoPlain.date(from: s) { return d }
         return nil
-    }
-
-    private static func fallbackDay(_ file: URL) -> String {
-        let parts = file.pathComponents
-        if parts.count >= 4 {
-            let segs = Array(parts.suffix(4).prefix(3))
-            if segs.allSatisfy({ $0.count >= 2 && $0.allSatisfy(\.isNumber) }) {
-                return segs.joined(separator: "-")
-            }
-        }
-        return Fmt.day(Date())
     }
 
     private static func toInt64(_ v: Any?) -> Int64 {

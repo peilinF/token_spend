@@ -29,7 +29,15 @@ struct Row {
 
 struct SQLiteError: Error, CustomStringConvertible {
     let message: String
-    var description: String { message }
+    let code: Int32?
+    init(message: String, code: Int32? = nil) {
+        self.message = message
+        self.code = code
+    }
+    var description: String {
+        if let code { return "\(message) (sqlite rc=\(code))" }
+        return message
+    }
 }
 
 final class SQLiteDatabase {
@@ -91,9 +99,19 @@ final class SQLiteDatabase {
         }
 
         var count = 0
-        while sqlite3_step(stmt) == SQLITE_ROW {
-            rowHandler(Row(stmt: stmt!))
-            count += 1
+        while true {
+            let rc = sqlite3_step(stmt)
+            if rc == SQLITE_ROW {
+                rowHandler(Row(stmt: stmt!))
+                count += 1
+            } else if rc == SQLITE_DONE {
+                break
+            } else {
+                throw SQLiteError(
+                    message: String(cString: sqlite3_errmsg(handle)),
+                    code: rc
+                )
+            }
         }
         return count
     }

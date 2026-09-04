@@ -39,6 +39,9 @@ struct DetailView: View {
             if !state.waiting.isEmpty {
                 waitingBanner
             }
+            if let storeError = state.storeError {
+                storeErrorBanner(storeError)
+            }
             Picker("", selection: Binding(get: { state.period }, set: { state.period = $0 })) {
                 ForEach(Period.allCases, id: \.self) { Text($0.shortName).tag($0) }
             }
@@ -76,8 +79,33 @@ struct DetailView: View {
         .background(RoundedRectangle(cornerRadius: 8).fill(Color.orange.opacity(0.14)))
     }
 
-    private var sortedWaiting: [(tool: Tool, info: WaitingInfo)] {
-        state.waiting
+    private func storeErrorBanner(_ message: String) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: "exclamationmark.triangle")
+                .font(.system(size: 10, weight: .bold))
+                .foregroundColor(.red)
+            Text("本地存储异常：" + message)
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundColor(.red)
+                .lineLimit(2)
+                .fixedSize(horizontal: false, vertical: true)
+                .multilineTextAlignment(.leading)
+            Spacer(minLength: 0)
+            Button {
+                Task { await state.refreshAll(force: true) }
+            } label: {
+                Text("重试")
+                    .font(.system(size: 10, weight: .bold))
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 5)
+        .background(RoundedRectangle(cornerRadius: 8).fill(Color.red.opacity(0.12)))
+        .accessibilityLabel("本地存储异常：" + message)
+    }
+
+    private var sortedWaiting: [(tool: Tool, info: WaitingInfo)] {        state.waiting
             .map { ($0.key, $0.value) }
             .sorted { a, b in
                 if a.info.kind != b.info.kind {

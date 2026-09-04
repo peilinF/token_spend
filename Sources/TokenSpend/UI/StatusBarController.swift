@@ -1,5 +1,6 @@
 import AppKit
 import Combine
+import UniformTypeIdentifiers
 
 extension Tool {
     var menuBarColor: NSColor { NSColor(color) }
@@ -53,8 +54,8 @@ final class StatusBarController {
         var parts: [String] = []
         if let quota = state.codexQuota {
             var windows: [String] = []
-            if let primary = quota.primary { windows.append("5h剩\(Int(primary.leftPercent))%") }
-            if let secondary = quota.secondary { windows.append("周剩\(Int(secondary.leftPercent))%") }
+            if let primary = quota.primary { windows.append("\(primary.shortLabel)剩\(Int(primary.leftPercent))%") }
+            if let secondary = quota.secondary { windows.append("\(secondary.shortLabel)剩\(Int(secondary.leftPercent))%") }
             if !windows.isEmpty { parts.append("codex " + windows.joined(separator: "/")) }
         }
         if let quota = state.cursorQuota, let total = quota.totalPercentUsed {
@@ -215,6 +216,10 @@ final class StatusBarController {
         diagItem.target = self
         menu.addItem(diagItem)
 
+        let csvItem = NSMenuItem(title: "导出用量 CSV…", action: #selector(exportCSV(_:)), keyEquivalent: "")
+        csvItem.target = self
+        menu.addItem(csvItem)
+
         menu.addItem(.separator())
         let quit = NSMenuItem(title: "退出 TokenSpend", action: #selector(quit(_:)), keyEquivalent: "q")
         quit.target = self
@@ -280,6 +285,19 @@ final class StatusBarController {
 
     @objc private func exportDiagnostics(_ sender: NSMenuItem) {
         Diagnostics.revealLog()
+    }
+
+    @objc private func exportCSV(_ sender: NSMenuItem) {
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [.commaSeparatedText]
+        panel.nameFieldStringValue = "tokenspend.csv"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        let csv = UsageStore.shared.exportCSV(sinceDay: "2000-01-01")
+        do {
+            try csv.write(to: url, atomically: true, encoding: .utf8)
+        } catch {
+            Diagnostics.recordStoreError(error, context: "exportCSV")
+        }
     }
 
     @objc private func quit(_ sender: NSMenuItem) {

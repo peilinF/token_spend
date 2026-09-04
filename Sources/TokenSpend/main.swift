@@ -8,16 +8,39 @@ if arguments.contains("--print-summary") {
     exit(0)
 }
 
+if let idx = arguments.firstIndex(of: "--export-csv") {
+    let store = UsageStore.shared
+    let csv = store.exportCSV(sinceDay: "2000-01-01")
+    let next = arguments.index(after: idx)
+    if next < arguments.endIndex, !arguments[next].hasPrefix("-") {
+        do {
+            try csv.write(toFile: arguments[next], atomically: true, encoding: .utf8)
+            print("exported \(arguments[next])")
+        } catch {
+            fputs("export failed: \(error)\n", stderr)
+            exit(1)
+        }
+    } else {
+        print(csv, terminator: "")
+    }
+    exit(0)
+}
+
 if arguments.contains("--reconcile") {
     let store = UsageStore.shared
-    OpenCodeSource.reconcile(store: store)
-    CodexSource.reconcile(store: store)
-    print("reconcile done")
+    do {
+        try OpenCodeSource.reconcile(store: store)
+        try CodexSource.reconcile(store: store)
+        print("reconcile done")
+    } catch {
+        fputs("reconcile failed: \(error)\n", stderr)
+        exit(1)
+    }
     exit(0)
 }
 
 if arguments.contains("--print-waiting") {
-    let threshold = UserDefaults.standard.object(forKey: "wait_threshold") as? TimeInterval ?? 60
+    let threshold = UserDefaults.standard.object(forKey: PrefKeys.waitThreshold) as? TimeInterval ?? 60
     let detected = WaitingDetector.detect(threshold: threshold)
     if detected.isEmpty {
         print("waiting: none")
@@ -31,15 +54,15 @@ if arguments.contains("--print-waiting") {
 
 if arguments.contains("--print-quota") {
     let store = UsageStore.shared
-    if let quota = CodexQuota.decode(fromJSON: store.meta("codex_rate_limits")) {
-        var windows: [String] = []
-        if let w = quota.primary { windows.append("5h剩\(Int(w.leftPercent))%(window \(w.windowMinutes ?? 0)min)") }
-        if let w = quota.secondary { windows.append("周剩\(Int(w.leftPercent))%") }
+        if let quota = CodexQuota.decode(fromJSON: store.meta(StoreKeys.codexRateLimits)) {
+            var windows: [String] = []
+            if let w = quota.primary { windows.append("\(w.shortLabel)剩\(Int(w.leftPercent))%") }
+            if let w = quota.secondary { windows.append("\(w.shortLabel)剩\(Int(w.leftPercent))%") }
         print("codex:", windows.joined(separator: " | "), quota.planType.map { "[\($0)]" } ?? "")
     } else {
         print("codex: none")
     }
-    if let quota = CursorQuota.decode(fromJSON: store.meta("cursor_quota")) {
+    if let quota = CursorQuota.decode(fromJSON: store.meta(StoreKeys.cursorQuota)) {
         func pct(_ v: Double?) -> String { v.map { String(format: "%.0f%%", $0) } ?? "-" }
         print("cursor: total used \(pct(quota.totalPercentUsed)), auto \(pct(quota.autoPercentUsed)), api \(pct(quota.apiPercentUsed)), cycle \(quota.cycleStart.map(Fmt.shortDate) ?? "?")~\(quota.cycleEnd.map(Fmt.shortDate) ?? "?"), used \(quota.used ?? -1)/\(quota.limit ?? -1), bonus \(quota.bonus ?? 0)")
     } else {
@@ -80,12 +103,24 @@ app.run()
 enum CliMain {
     static func run() {
         let store = UsageStore.shared
-        try? OpenCodeSource.refresh(store: store)
-        try? CodexSource.refresh(store: store)
+        do {
+            try OpenCodeSource.refresh(store: store)
+        } catch {
+            fputs("opencode refresh failed: \(error)\n", stderr)
+        }
+        do {
+            try CodexSource.refresh(store: store)
+        } catch {
+            fputs("codex refresh failed: \(error)\n", stderr)
+        }
 
         let semaphore = DispatchSemaphore(value: 0)
         Task.detached {
-            _ = try? await CursorSource.refresh(store: store)
+            do {
+                _ = try await CursorSource.refresh(store: store)
+            } catch {
+                fputs("cursor refresh failed: \(error)\n", stderr)
+            }
             semaphore.signal()
         }
         _ = semaphore.wait(timeout: .now() + 90)

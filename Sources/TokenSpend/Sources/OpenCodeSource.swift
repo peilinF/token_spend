@@ -31,53 +31,79 @@ enum OpenCodeSource {
         return running
     }
 
-    static func reconcile(store: UsageStore) {
+    static func reconcile(store: UsageStore) throws {
         guard FileManager.default.fileExists(atPath: dbPath),
               let db = try? SQLiteDatabase(path: dbPath, readonly: true) else { return }
         var ids = Set<String>()
-        try? db.query(
+        try db.query(
             "SELECT id FROM message WHERE json_extract(data,'$.role')='assistant'",
             binds: []
         ) { row in
             if let id = row.text(0) { ids.insert(id) }
         }
-        store.deleteSourceKeysNotIn(source: .opencode, validKeys: ids)
+        try store.deleteSourceKeysNotIn(source: .opencode, validKeys: ids)
     }
 
     static func refresh(store: UsageStore, overlapMS: Int64 = 120_000) throws {
         guard FileManager.default.fileExists(atPath: dbPath) else { return }
         let db = try SQLiteDatabase(path: dbPath, readonly: true)
-        let watermark = Double(store.meta("oc_wm") ?? "0") ?? 0
+        let watermark = Double(store.meta(StoreKeys.opencodeWatermark) ?? "0") ?? 0
         let since = Int64(max(0, watermark - Double(overlapMS)))
 
+        // Paged by (time_updated, id) so a large history DB never loads all
+        // rows into memory at once; ties on time_updated can't skip rows.
+        var cursorUpdated = since
+        var cursorId = ""
         var maxUpdated: Int64 = Int64(watermark)
-        try db.query(
-            "SELECT id, time_created, time_updated, data FROM message WHERE time_updated > ? ORDER BY time_updated ASC",
-            binds: [.int(since)]
-        ) { row in
-            guard let id = row.text(0),
-                  let created = row.text(1).flatMap({ Double($0) }),
-                  let updated = row.text(2).flatMap({ Double($0) }),
-                  let dataStr = row.text(3) else { return }
-            maxUpdated = max(maxUpdated, Int64(updated))
+        var pages = 0
+        while true {
+            var pending: [ContribEntry] = []
+            pending.reserveCapacity(500)
+            var rows = 0
+            var pageMax: Int64 = cursorUpdated
+            var pageLastId = cursorId
+            try db.query(
+                "SELECT id, time_created, time_updated, data FROM message " +
+                "WHERE (time_updated > ? OR (time_updated = ? AND id > ?)) " +
+                "ORDER BY time_updated ASC, id ASC LIMIT 500",
+                binds: [.int(cursorUpdated), .int(cursorUpdated), .text(cursorId)]
+            ) { row in
+                guard let id = row.text(0),
+                      let created = row.text(1).flatMap({ Double($0) }),
+                      let updated = row.text(2).flatMap({ Double($0) }),
+                      let dataStr = row.text(3) else { return }
+                rows += 1
+                pageMax = max(pageMax, Int64(updated))
+                pageLastId = id
 
-            guard let data = parseJSON(dataStr),
-                  let role = data["role"] as? String, role == "assistant",
-                  let tokens = data["tokens"] as? [String: Any] else { return }
+                guard let data = parseJSON(dataStr),
+                      let role = data["role"] as? String, role == "assistant",
+                      let tokens = data["tokens"] as? [String: Any] else { return }
 
-            var amount = UsageAmount()
-            amount.input = toInt64(tokens["input"])
-            amount.output = toInt64(tokens["output"])
-            if let cache = tokens["cache"] as? [String: Any] {
-                amount.cacheRead = toInt64(cache["read"])
-                amount.cacheWrite = toInt64(cache["write"])
+                var amount = UsageAmount()
+                amount.input = toInt64(tokens["input"])
+                amount.output = toInt64(tokens["output"])
+                if let cache = tokens["cache"] as? [String: Any] {
+                    amount.cacheRead = toInt64(cache["read"])
+                    amount.cacheWrite = toInt64(cache["write"])
+                }
+                amount.cost = (data["cost"] as? NSNumber)?.doubleValue ?? 0
+
+                let day = Fmt.day(Date(timeIntervalSince1970: created / 1000))
+                pending.append(ContribEntry(source: .opencode, key: id, day: day, amount: amount))
             }
-            amount.cost = (data["cost"] as? NSNumber)?.doubleValue ?? 0
-
-            let day = Fmt.day(Date(timeIntervalSince1970: created / 1000))
-            store.upsert(source: .opencode, key: id, day: day, amount: amount)
+            // Commit rows first; only advance the watermark after the batch
+            // lands, so a crash mid-loop replays instead of skipping rows.
+            if !pending.isEmpty {
+                try store.batchUpsert(pending)
+            }
+            maxUpdated = max(maxUpdated, pageMax)
+            try store.setMeta(StoreKeys.opencodeWatermark, String(maxUpdated))
+            pages += 1
+            guard rows == 500, pages < 400 else { break }
+            cursorUpdated = pageMax
+            cursorId = pageLastId
         }
-        store.setMeta("oc_wm", String(maxUpdated))
     }
 
     private static func parseJSON(_ s: String) -> [String: Any]? {
