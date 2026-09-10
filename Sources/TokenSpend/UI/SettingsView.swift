@@ -2,6 +2,9 @@ import SwiftUI
 
 struct SettingsView: View {
     @ObservedObject var state: AppState
+    /// Drag-local scale: committed to AppState only on release, so a single
+    /// drag doesn't fire dozens of full circle relayouts (slider lag).
+    @State private var scaleDraft: Double?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -21,13 +24,20 @@ struct SettingsView: View {
                 Text("界面缩放").font(.system(size: 11))
                 Slider(
                     value: Binding(
-                        get: { state.widgetScale },
-                        set: { state.widgetScale = (($0 / 0.05).rounded() * 0.05) }
+                        get: { scaleDraft ?? state.widgetScale },
+                        set: { scaleDraft = (($0 / 0.05).rounded() * 0.05) }
                     ),
-                    in: 1.0...2.5
+                    in: 1.0...2.5,
+                    onEditingChanged: { editing in
+                        if !editing, let draft = scaleDraft {
+                            scaleDraft = nil
+                            state.widgetScale = draft
+                        }
+                    },
+                    label: { EmptyView() }
                 )
                 .controlSize(.small)
-                Text("\(Int((state.widgetScale * 100).rounded()))%")
+                Text("\(Int(((scaleDraft ?? state.widgetScale) * 100).rounded()))%")
                     .font(.system(size: 10, weight: .semibold))
                     .monospacedDigit()
                     .frame(width: 38, alignment: .trailing)

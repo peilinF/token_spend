@@ -1,4 +1,5 @@
 import AppKit
+import Darwin
 import Foundation
 
 let arguments = CommandLine.arguments
@@ -95,6 +96,27 @@ if arguments.contains("--print-live") {    var done = false
 }
 
 let app = NSApplication.shared
+
+// Single-instance guard (placed after the --print-* CLI early-exits so
+// diagnostics keep working while the app runs). A second copy (debug build
+// next to the installed app, double-clicked .app, …) would otherwise
+// double-sync, double-poll and show two menu icons — and quitting one
+// leaves the other running, looking like "quit doesn't work".
+do {
+    let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        .appendingPathComponent("TokenSpend", isDirectory: true)
+    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    let lockPath = dir.appendingPathComponent("instance.lock").path
+    let fd = open(lockPath, O_RDWR | O_CREAT, 0o600)
+    // fd intentionally leaked: the lock lives as long as the process.
+    // flock auto-releases on crash, so no stale-lock cleanup is needed.
+    guard fd >= 0, flock(fd, LOCK_EX | LOCK_NB) == 0 else {
+        if fd >= 0 { close(fd) }
+        NSLog("TokenSpend: another instance is already running, exiting")
+        exit(0)
+    }
+}
+
 let delegate = AppDelegate()
 app.delegate = delegate
 app.setActivationPolicy(.accessory)

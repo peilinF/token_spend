@@ -109,7 +109,10 @@ struct CircleView: View {
                         .stroke(Color.primary.opacity(0.12), lineWidth: 1)
 
                     TimelineView(.animation(
-                        minimumInterval: 1.0 / Double(max(1, state.animationFPS)),
+                        // Breathing is a slow 1.8s wave: 10fps is visually
+                        // identical and halves wakeups vs the 30/60fps arcs.
+                        // Static when not waiting (progress moves by minutes).
+                        minimumInterval: 0.1,
                         paused: !isWaiting || panel.circleOccluded
                     )) { timeline in
                         let opacity: Double = {
@@ -214,25 +217,29 @@ struct ActivityArcsView: View {
     let tools: [Tool]
     let paused: Bool
     let fps: Int
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
-        TimelineView(.animation(minimumInterval: 1.0 / Double(max(1, fps)), paused: paused || tools.isEmpty)) { timeline in
+        TimelineView(.animation(
+            minimumInterval: 1.0 / Double(max(1, fps)),
+            paused: paused || tools.isEmpty || reduceMotion
+        )) { timeline in
             let t = timeline.date.timeIntervalSinceReferenceDate
             let spin = (t * 115).truncatingRemainder(dividingBy: 360)
-            let wobble = sin(t * 3.2) * 0.7 + 0.3
             let pulse = 0.985 + 0.035 * (sin(t * 5.7) + 1) / 2
 
             ZStack {
                 if !tools.isEmpty {
-                    ambientGlow(intensity: wobble)
-
+                    // NOTE: no blur anywhere on this view — any blurred layer on
+                    // a borderless transparent NSPanel composites its edges as
+                    // black (the "square block" / "fan" artifacts). The halo
+                    // effect comes from the opacity-only duplicate below.
                     ZStack {
                         ForEach(Array(tools.enumerated()), id: \.element) { index, _ in
                             arc(for: index, glow: true)
                         }
                     }
-                    .blur(radius: 7)
-                    .opacity(0.85)
+                    .opacity(0.5)
 
                     ZStack {
                         ForEach(Array(tools.enumerated()), id: \.element) { index, _ in
@@ -253,22 +260,6 @@ struct ActivityArcsView: View {
         }
     }
 
-    private func ambientGlow(intensity: Double) -> some View {
-        let colors = tools.map { $0.color.opacity(0.22 * intensity) }
-        let gradientColors: [Color] = colors.isEmpty ? [.clear] : colors + [colors[0].opacity(0.06), .clear]
-        return Circle()
-            .fill(
-                RadialGradient(
-                    colors: gradientColors,
-                    center: .center,
-                    startRadius: 14,
-                    endRadius: 44
-                )
-            )
-            .frame(width: 96, height: 96)
-            .blur(radius: 9)
-    }
-
     private var scanSweep: some View {
         Circle()
             .trim(from: 0, to: 0.18)
@@ -281,7 +272,7 @@ struct ActivityArcsView: View {
             )
             .frame(width: 90, height: 90)
             .opacity(0.5)
-            .blur(radius: 0.5)
+        // no .blur: see note above about blur on transparent windows
     }
 
     private func arc(for index: Int, glow: Bool) -> some View {
@@ -292,12 +283,13 @@ struct ActivityArcsView: View {
         let endFraction = min(startFraction + spanDegrees / 360, startFraction + 0.96)
         let color = tools[index].color
 
+        // No white/transparent tail stops: semi-transparent gradient pixels
+        // at the arc edges composite as near-black on this transparent panel.
         let gradient = AngularGradient(
             gradient: Gradient(stops: [
                 .init(color: color.opacity(0.0), location: 0),
                 .init(color: color.opacity(glow ? 0.55 : 0.95), location: 0.35),
-                .init(color: color, location: 0.78),
-                .init(color: .white.opacity(glow ? 0.35 : 0.9), location: 1.0),
+                .init(color: color, location: 1.0),
             ]),
             center: .center,
             startAngle: .degrees(startFraction * 360),
@@ -310,8 +302,8 @@ struct ActivityArcsView: View {
                 gradient,
                 style: StrokeStyle(lineWidth: glow ? 9 : 4.2, lineCap: .round)
             )
-            .shadow(color: color.opacity(glow ? 0.0 : 0.92), radius: glow ? 0 : 7)
-            .shadow(color: color.opacity(glow ? 0.0 : 0.55), radius: glow ? 0 : 14)
+            // no .shadow: shadow/blur are rasterized layers and composite
+            // black onto this borderless transparent panel's edges
     }
 
     private func cometHead(for index: Int) -> some View {
@@ -326,8 +318,6 @@ struct ActivityArcsView: View {
             Circle()
                 .fill(color)
                 .frame(width: 7.5, height: 7.5)
-                .shadow(color: color, radius: 6)
-                .shadow(color: .white.opacity(0.9), radius: 2)
             Circle()
                 .fill(.white)
                 .frame(width: 3.2, height: 3.2)
@@ -339,9 +329,10 @@ struct ActivityArcsView: View {
 
 struct PulseEffect: ViewModifier {
     var paused: Bool = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     func body(content: Content) -> some View {
-        TimelineView(.animation(minimumInterval: 0.05, paused: paused)) { timeline in
+        TimelineView(.animation(minimumInterval: 0.05, paused: paused || reduceMotion)) { timeline in
             let t = timeline.date.timeIntervalSinceReferenceDate
             let wave = (sin(t * .pi / 0.4) + 1) / 2
             content

@@ -1,5 +1,39 @@
 import Foundation
 
+/// Pooled readonly handle to the live opencode DB (370MB+ and growing).
+/// Polling used to open a FRESH connection per call and run full scans with
+/// a cold page cache (seconds of pread per call, ~75% CPU). Reuse keeps
+/// SQLite's cache warm; hot paths add an mtime short-circuit so idle polls
+/// cost a single stat. Thread-safe via NSLock (SQLiteDatabase locks per op).
+enum OpenCodeDB {
+    private static let lock = NSLock()
+    private static var handle: SQLiteDatabase?
+    private static var inode: UInt64 = 0
+
+    /// DB file mtime, or nil when absent. One stat syscall.
+    static func mtime() -> Date? {
+        (try? FileManager.default.attributesOfItem(atPath: OpenCodeSource.dbPath)[.modificationDate] as? Date) ?? nil
+    }
+
+    static func shared() -> SQLiteDatabase? {
+        lock.lock()
+        defer { lock.unlock() }
+        let path = OpenCodeSource.dbPath
+        let attrs = (try? FileManager.default.attributesOfItem(atPath: path)) ?? [:]
+        guard !attrs.isEmpty else {
+            handle = nil // gone; reopen retried on the next call
+            inode = 0
+            return nil
+        }
+        let ino = (attrs[.systemFileNumber] as? NSNumber)?.uint64Value ?? 0
+        if handle == nil || (inode != 0 && ino != 0 && ino != inode) {
+            handle = try? SQLiteDatabase(path: path, readonly: true)
+            inode = ino
+        }
+        return handle
+    }
+}
+
 enum OpenCodeSource {
     static var dbPath: String {
         let home = FileManager.default.homeDirectoryForCurrentUser
@@ -7,8 +41,12 @@ enum OpenCodeSource {
     }
 
     static func isActive(within interval: TimeInterval) -> Bool {
-        guard FileManager.default.fileExists(atPath: dbPath),
-              let db = try? SQLiteDatabase(path: dbPath, readonly: true) else { return false }
+        // Zero-cost idle path: a part with fresh time_updated implies a
+        // file write, so a DB untouched for longer than both lookback
+        // windows cannot contain fresh activity. One stat syscall.
+        guard let mtime = OpenCodeDB.mtime(),
+              mtime >= Date().addingTimeInterval(-max(interval, 180)) else { return false }
+        guard let db = OpenCodeDB.shared() else { return false }
         var maxUpdated = 0.0
         try? db.query("SELECT MAX(time_updated) FROM part", binds: []) { row in
             maxUpdated = row.double(0)
@@ -32,8 +70,7 @@ enum OpenCodeSource {
     }
 
     static func reconcile(store: UsageStore) throws {
-        guard FileManager.default.fileExists(atPath: dbPath),
-              let db = try? SQLiteDatabase(path: dbPath, readonly: true) else { return }
+        guard let db = OpenCodeDB.shared() else { return }
         var ids = Set<String>()
         try db.query(
             "SELECT id FROM message WHERE json_extract(data,'$.role')='assistant'",
@@ -45,8 +82,7 @@ enum OpenCodeSource {
     }
 
     static func refresh(store: UsageStore, overlapMS: Int64 = 120_000) throws {
-        guard FileManager.default.fileExists(atPath: dbPath) else { return }
-        let db = try SQLiteDatabase(path: dbPath, readonly: true)
+        guard let db = OpenCodeDB.shared() else { return }
         let watermark = Double(store.meta(StoreKeys.opencodeWatermark) ?? "0") ?? 0
         let since = Int64(max(0, watermark - Double(overlapMS)))
 

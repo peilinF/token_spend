@@ -83,8 +83,7 @@ final class WaitingMonitor {
 
     private func opencodeQuestionFastPath(now: Date) -> Bool {
         guard WaitingDetector.processAlive(named: "opencode"),
-              FileManager.default.fileExists(atPath: OpenCodeSource.dbPath),
-              let db = try? SQLiteDatabase(path: OpenCodeSource.dbPath, readonly: true) else {
+              let db = OpenCodeDB.shared() else {
             ocPendingQuestions.removeAll()
             return false
         }
@@ -165,8 +164,7 @@ final class WaitingMonitor {
             }
         }
         // Fallback: legacy DB check for tool:"permission" (covers future opencode versions)
-        guard FileManager.default.fileExists(atPath: OpenCodeSource.dbPath),
-              let db = try? SQLiteDatabase(path: OpenCodeSource.dbPath, readonly: true) else {
+        guard let db = OpenCodeDB.shared() else {
             ocPendingPermissions.removeAll()
             return false
         }
@@ -270,8 +268,7 @@ final class WaitingMonitor {
     }
 
     private func hasRunningOpencodePart(now: Date) -> Bool {
-        guard FileManager.default.fileExists(atPath: OpenCodeSource.dbPath),
-              let db = try? SQLiteDatabase(path: OpenCodeSource.dbPath, readonly: true) else { return false }
+        guard let db = OpenCodeDB.shared() else { return false }
         let since = Int64(now.addingTimeInterval(-120).timeIntervalSince1970 * 1000)
         var found = false
         try? db.query(
@@ -288,8 +285,7 @@ final class WaitingMonitor {
         guard !ocPendingQuestions.isEmpty || !ocPendingPermissions.isEmpty || now.timeIntervalSince(ocLastStalledScan) > 30 else { return false }
         ocLastStalledScan = now
         guard WaitingDetector.processAlive(named: "opencode"),
-              FileManager.default.fileExists(atPath: OpenCodeSource.dbPath),
-              let db = try? SQLiteDatabase(path: OpenCodeSource.dbPath, readonly: true) else { return false }
+              let db = OpenCodeDB.shared() else { return false }
 
         // A worker descendant (shell/interpreter/build tool) means a command
         // is executing, even if no part row was touched recently.
@@ -361,8 +357,7 @@ enum WaitingDetector {
     }
 
     private static func hasRunningOpencodePart(now: Date) -> Bool {
-        guard FileManager.default.fileExists(atPath: OpenCodeSource.dbPath),
-              let db = try? SQLiteDatabase(path: OpenCodeSource.dbPath, readonly: true) else { return false }
+        guard let db = OpenCodeDB.shared() else { return false }
         let since = Int64(now.addingTimeInterval(-120).timeIntervalSince1970 * 1000)
         var found = false
         try? db.query(
@@ -375,8 +370,7 @@ enum WaitingDetector {
     /// Newest `time_updated` among running parts. Progress after a permission
     /// asking proves the prompt was answered and the agent is working.
     static func latestRunningOpencodeProgress() -> Date? {
-        guard FileManager.default.fileExists(atPath: OpenCodeSource.dbPath),
-              let db = try? SQLiteDatabase(path: OpenCodeSource.dbPath, readonly: true) else { return nil }
+        guard let db = OpenCodeDB.shared() else { return nil }
         var maxUpdated: Int64 = 0
         try? db.query(
             "SELECT MAX(time_updated) FROM part WHERE json_extract(data,'$.state.status')='running'",
@@ -388,8 +382,7 @@ enum WaitingDetector {
 
     private static func opencodeStalledOneShot(threshold: TimeInterval, now: Date) -> WaitingKind? {
         guard processAlive(named: "opencode"),
-              FileManager.default.fileExists(atPath: OpenCodeSource.dbPath),
-              let db = try? SQLiteDatabase(path: OpenCodeSource.dbPath, readonly: true) else { return nil }
+              let db = OpenCodeDB.shared() else { return nil }
 
         var questionCount = 0
         try? db.query(

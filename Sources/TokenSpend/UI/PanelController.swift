@@ -1,5 +1,6 @@
 import AppKit
 import Combine
+import QuartzCore
 import SwiftUI
 
 final class PanelWindow: NSPanel {
@@ -180,8 +181,13 @@ final class PanelController: ObservableObject {
         guard abs(size.height - circlePanel.frame.height) > 0.5
                 || abs(size.width - circlePanel.frame.width) > 0.5 else { return }
         let topLeft = NSPoint(x: circlePanel.frame.minX, y: circlePanel.frame.maxY)
+        // Programmatic resize must not animate implicitly: it fights the
+        // 30fps TimelineView commits and reads as stutter.
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
         circlePanel.setContentSize(size)
         circlePanel.setFrameTopLeftPoint(topLeft)
+        CATransaction.commit()
         guard let view = circlePanel.contentView as? NSHostingView<CircleView> else { return }
         view.setFrameSize(size)
         ensureOnScreen()
