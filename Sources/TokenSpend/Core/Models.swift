@@ -273,7 +273,16 @@ struct CodexQuota: Equatable {
         func pick(_ s: [String: Any]?, _ i: [String: Any]?) -> [String: Any]? {
             guard let i else { return s }
             guard let s else { return i }
-            return resetsAt(i) >= resetsAt(s) ? i : s
+            let ri = resetsAt(i), rs = resetsAt(s)
+            // The server re-emits one logical window with resets_at jitter
+            // of a few seconds (observed up to ~8s). A strictly-monotonic
+            // compare lets a single outlier with resets_at seconds higher
+            // block every fresher update for the whole window, so near-equal
+            // resets count as the same window and the newer observation
+            // wins; only a clearly later resets_at (the next window) also
+            // wins, keeping the old anti-clobber guarantee.
+            if abs(ri - rs) <= 120 { return i }
+            return ri > rs ? i : s
         }
         var out: [String: Any] = [
             "observed_ts": max((record["observed_ts"] as? NSNumber)?.doubleValue ?? 0, observedTs)
