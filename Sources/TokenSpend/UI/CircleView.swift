@@ -162,6 +162,19 @@ struct CircleView: View {
                     .padding(.bottom, 8)
             }
         }
+        .gesture(windowDrag)
+    }
+
+    // Dragging the circle moves its NSPanel. Used to be NSPanel's
+    // movable-by-background, but newer macOS stopped initiating those drags
+    // on SwiftUI content. minimumDistance keeps a plain press as a tap for
+    // the inner onTapGesture (toggle detail). Drag state lives in
+    // PanelController because this toolchain's SDK lacks the compiler plugin
+    // for SwiftUI's @State macro.
+    private var windowDrag: some Gesture {
+        DragGesture(minimumDistance: 3)
+            .onChanged { _ in PanelController.shared.circleDragChanged() }
+            .onEnded { _ in PanelController.shared.circleDragEnded() }
     }
 
     private var hasQuotaData: Bool {

@@ -65,7 +65,10 @@ enum CursorLogs {
                     .timeIntervalSince1970 ?? 0
                 return am > bm
             }
-            .prefix(3)
+            // A user can keep several Cursor windows/sessions active. Three
+            // was enough for the common case but silently missed an active
+            // agent in the fourth session.
+            .prefix(10)
 
         var found: [(url: URL, mtime: TimeInterval)] = []
         for session in recentSessions {

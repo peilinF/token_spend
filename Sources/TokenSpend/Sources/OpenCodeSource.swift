@@ -10,9 +10,15 @@ enum OpenCodeDB {
     private static var handle: SQLiteDatabase?
     private static var inode: UInt64 = 0
 
-    /// DB file mtime, or nil when absent. One stat syscall.
+    /// The main DB can remain unchanged while SQLite appends to its WAL.
+    /// Include both files so refresh/activity polling never misses WAL-only
+    /// writes.
     static func mtime() -> Date? {
-        (try? FileManager.default.attributesOfItem(atPath: OpenCodeSource.dbPath)[.modificationDate] as? Date) ?? nil
+        let paths = [OpenCodeSource.dbPath, OpenCodeSource.dbPath + "-wal"]
+        let dates = paths.compactMap { path in
+            (try? FileManager.default.attributesOfItem(atPath: path)[.modificationDate] as? Date)
+        }
+        return dates.max()
     }
 
     static func shared() -> SQLiteDatabase? {
@@ -62,7 +68,7 @@ enum OpenCodeSource {
         let since = Int64(Date().addingTimeInterval(-180).timeIntervalSince1970 * 1000)
         var running = false
         try? db.query(
-            "SELECT 1 FROM part WHERE time_updated >= ? AND length(data) < 200000 " +
+            "SELECT 1 FROM part WHERE time_updated >= ? " +
             "AND data LIKE '%\"status\":\"running\"%' LIMIT 1",
             binds: [.int(since)]
         ) { _ in running = true }

@@ -230,10 +230,16 @@ enum CursorSource {
         var pageLimit: Int
         if incremental {
             startMs = max(0, existing - 30 * 60_000)
-            pageLimit = 3
+            // The overlap is intentionally replayed for idempotency. Three
+            // pages capped this at 600 events and could leave the newest
+            // cursor stale without any visible error.
+            pageLimit = 300
         } else {
             startMs = now.timeIntervalSince1970 * 1000 - 400 * 86_400_000
-            pageLimit = 60
+            // 60 pages silently dropped older history on busy accounts.
+            // Keep a generous bound, but report a partial result below when
+            // the server still has more rows.
+            pageLimit = 300
         }
 
         var page = 1
@@ -244,6 +250,7 @@ enum CursorSource {
         var storedAccount = store.meta(StoreKeys.cursorAccountId) ?? ""
         var detectedAccount: String?
         var didSwitchAccount = false
+        var stoppedAtExistingBoundary = false
 
         while fetched < total && page <= pageLimit {
             let body: [String: Any] = [
@@ -260,11 +267,18 @@ enum CursorSource {
                 throw CursorAPIError.unauthorized
             }
             total = (json["totalUsageEventsCount"] as? NSNumber)?.intValue ?? 0
-            guard let events = json["usageEventsDisplay"] as? [[String: Any]] else { break }
+            guard let events = json["usageEventsDisplay"] as? [[String: Any]] else {
+                throw CursorAPIError.badResponse
+            }
 
             var pageMinTs = Double.greatestFiniteMagnitude
             var pageMaxTs: Double = 0
-            var pageOwningUser: String?
+            let pageOwningUser: String? = events.compactMap { event -> String? in
+                guard let u = event["owningUser"] as? String, !u.isEmpty, u != "0" else { return nil }
+                return u
+            }.first
+            let scopeEventsToAccount = !storedAccount.isEmpty
+                && pageOwningUser != nil && pageOwningUser != storedAccount
             var pageEntries: [ContribEntry] = []
             pageEntries.reserveCapacity(events.count)
 
@@ -272,9 +286,6 @@ enum CursorSource {
                 guard let tsStr = event["timestamp"] as? String, let ts = Double(tsStr) else { continue }
                 pageMinTs = min(pageMinTs, ts)
                 pageMaxTs = max(pageMaxTs, ts)
-                if pageOwningUser == nil, let u = event["owningUser"] as? String, !u.isEmpty, u != "0" {
-                    pageOwningUser = u
-                }
 
                 let tokenUsage = event["tokenUsage"] as? [String: Any] ?? [:]
                 var amount = UsageAmount()
@@ -290,7 +301,10 @@ enum CursorSource {
 
                 let conv = event["conversationId"] as? String ?? "-"
                 let kind = event["kind"] as? String ?? ""
-                let key = eventKey(event, ts: ts, conv: conv, kind: kind)
+                let key = eventKey(
+                    event, ts: ts, conv: conv, kind: kind,
+                    account: scopeEventsToAccount ? pageOwningUser : nil
+                )
                 let day = Fmt.day(Date(timeIntervalSince1970: ts / 1000))
                 pageEntries.append(ContribEntry(source: .cursor, key: key, day: day, amount: amount))
                 maxTs = max(maxTs, ts)
@@ -306,7 +320,7 @@ enum CursorSource {
                     didSwitchAccount = true
                     // 新账号的旧历史在增量窗口外，需要回溯 400 天补齐，但保留旧号数据
                     startMs = now.timeIntervalSince1970 * 1000 - 400 * 86_400_000
-                    pageLimit = 60
+                    pageLimit = 300
                     existing = 0
                     previousPageMinTs = 0
                     // 已抓的这页是新号的近期数据，已入库，继续拉更早的页
@@ -316,27 +330,46 @@ enum CursorSource {
             }
 
             fetched += events.count
-            if events.isEmpty { break }
+            if events.isEmpty {
+                stoppedAtExistingBoundary = true
+                break
+            }
 
             if existing > 0, pageMaxTs > 0, pageMaxTs < existing,
                previousPageMinTs > 0, pageMaxTs <= previousPageMinTs {
+                stoppedAtExistingBoundary = true
                 break
             }
             previousPageMinTs = pageMinTs == Double.greatestFiniteMagnitude ? 0 : pageMinTs
             page += 1
         }
-        try store.setMeta(StoreKeys.cursorLastTs, String(maxTs))
+        let complete = fetched >= total || stoppedAtExistingBoundary
+        if complete {
+            try store.setMeta(StoreKeys.cursorLastTs, String(maxTs))
+        } else {
+            // Never advance the watermark after a page cap. Replaying the
+            // same range is safe because stable event IDs upsert idempotently;
+            // silently advancing here permanently loses older history.
+            Diagnostics.debug("cursor usage sync partial: fetched \(fetched)/\(total) events")
+        }
         if let account = detectedAccount, !account.isEmpty {
             try store.setMeta(StoreKeys.cursorAccountId, account)
         }
     }
 
-    private static func eventKey(_ event: [String: Any], ts: Double, conv: String, kind: String) -> String {
+    private static func eventKey(
+        _ event: [String: Any],
+        ts: Double,
+        conv: String,
+        kind: String,
+        account: String?
+    ) -> String {
         let stable = (event["id"] as? String) ?? (event["usageEventId"] as? String)
         if let stable, !stable.isEmpty {
-            return stable
+            return account.map { "\($0)|\(stable)" } ?? stable
         }
-        return "\(Int64(ts))|\(conv)|\(kind)"
+        let legacy = "\(Int64(ts))|\(conv)|\(kind)"
+        return account.map { "\($0)|\(legacy)" } ?? legacy
     }
 
     private static func eventCost(_ event: [String: Any]) -> Double {
@@ -349,11 +382,13 @@ enum CursorSource {
                 ?? toDouble(obj["chargedCents"]) {
                 return v / 100
             }
-            if let v = toDouble(obj["cost"]) {
-                if v >= 100, v == v.rounded() { return v / 100 }
-                return v
+            for key in ["dollars", "usd", "costUsd", "costUSD", "amountUsd"] {
+                if let v = toDouble(obj[key]) { return v }
             }
         }
+        // A generic `cost` has no reliable unit across Cursor API versions;
+        // guessing cents vs dollars creates plausible but wrong totals.
+        // Token counts remain useful and the UI can show cost as unavailable.
         return 0
     }
 

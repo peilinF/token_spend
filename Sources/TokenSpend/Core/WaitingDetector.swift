@@ -49,10 +49,13 @@ final class WaitingMonitor {
     private var ocLastRowid: Int64 = 0
     private var ocPermLastRowid: Int64 = 0
     private var ocPrimed = false
+    private var ocPermissionPrimed = false
     private var ocPendingQuestions: Set<Int64> = []
     private var ocPendingPermissions: Set<Int64> = []
     private var ocLastFullScan = Date.distantPast
     private var ocPermLastFullScan = Date.distantPast
+    private var ocLastStalledScan = Date.distantPast
+    private var ocLastStalledResult = false
 
     func poll(threshold: TimeInterval) -> [Tool: WaitingKind] {
         lock.lock()
@@ -114,7 +117,7 @@ final class WaitingMonitor {
 
         if maxRowid > ocLastRowid {
             try? db.query(
-                "SELECT rowid FROM part WHERE rowid > ? AND rowid <= ? AND length(data) < 50000 " +
+                "SELECT rowid FROM part WHERE rowid > ? AND rowid <= ? " +
                 "AND data LIKE '%\"tool\":\"question\"%' AND json_extract(data,'$.state.status')='running'",
                 binds: [.int(ocLastRowid), .int(maxRowid)]
             ) { [weak self] row in
@@ -126,8 +129,8 @@ final class WaitingMonitor {
         if now.timeIntervalSince(ocLastFullScan) > 60 {
             ocLastFullScan = now
             try? db.query(
-                "SELECT rowid FROM part WHERE length(data) < 50000 " +
-                "AND data LIKE '%\"tool\":\"question\"%' AND json_extract(data,'$.state.status')='running'",
+                "SELECT rowid FROM part WHERE " +
+                "data LIKE '%\"tool\":\"question\"%' AND json_extract(data,'$.state.status')='running'",
                 binds: []
             ) { row in
                 ocPendingQuestions.insert(row.int(0))
@@ -187,13 +190,14 @@ final class WaitingMonitor {
         try? db.query("SELECT MAX(rowid) FROM part", binds: []) { row in
             maxRowid = row.int(0)
         }
-        if !ocPrimed {
+        if !ocPermissionPrimed {
+            ocPermissionPrimed = true
             ocPermLastRowid = maxRowid
             ocPermLastFullScan = now
         }
         if maxRowid > ocPermLastRowid {
             try? db.query(
-                "SELECT rowid FROM part WHERE rowid > ? AND rowid <= ? AND length(data) < 60000 " +
+                "SELECT rowid FROM part WHERE rowid > ? AND rowid <= ? " +
                 "AND data LIKE '%\"tool\":\"permission\"%' AND json_extract(data,'$.state.status')='running'",
                 binds: [.int(ocPermLastRowid), .int(maxRowid)]
             ) { [weak self] row in
@@ -205,8 +209,8 @@ final class WaitingMonitor {
         if now.timeIntervalSince(ocPermLastFullScan) > 60 {
             ocPermLastFullScan = now
             try? db.query(
-                "SELECT rowid FROM part WHERE length(data) < 60000 " +
-                "AND data LIKE '%\"tool\":\"permission\"%' AND json_extract(data,'$.state.status')='running'",
+                "SELECT rowid FROM part WHERE " +
+                "data LIKE '%\"tool\":\"permission\"%' AND json_extract(data,'$.state.status')='running'",
                 binds: []
             ) { row in
                 ocPendingPermissions.insert(row.int(0))
@@ -230,15 +234,14 @@ final class WaitingMonitor {
         return !ocPendingPermissions.isEmpty
     }
 
-    /// Latest `message=asking id=per_*` timestamp (nil if none in 24h).
+    /// Latest `message=asking id=per_*` timestamp.
     /// Returned from file content only (no wall-clock math inside), so the
     /// FileResultCache entry can't go stale while the log is quiet.
     private func latestOpencodePermissionAsking(now: Date) -> Date? {
         let logURL = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".local/share/opencode/log/opencode.log")
         guard FileManager.default.fileExists(atPath: logURL.path) else { return nil }
-        let cutoff = now.addingTimeInterval(-86_400)
-        return FileResultCache.shared.value(for: logURL, namespace: "opencode_perm_log") {
+        let latest: Date? = FileResultCache.shared.value(for: logURL, namespace: "opencode_perm_log") {
             guard let handle = try? FileHandle(forReadingFrom: logURL) else { return nil as Date? }
             defer { try? handle.close() }
             let size = Int64((try? handle.seekToEnd()) ?? 0)
@@ -255,7 +258,6 @@ final class WaitingMonitor {
                     if let end = after.firstIndex(of: " ") {
                         let tsStr = String(after[..<end])
                         if let date = Formatters.isoFractional.date(from: tsStr) ?? Formatters.isoPlain.date(from: tsStr) {
-                            if date < cutoff { continue }
                             if latest == nil || date > latest! { latest = date }
                         }
                     }
@@ -265,6 +267,7 @@ final class WaitingMonitor {
             }
             return latest
         }
+        return latest.flatMap { $0 > now.addingTimeInterval(-86_400) ? $0 : nil }
     }
 
     private func hasRunningOpencodePart(now: Date) -> Bool {
@@ -280,17 +283,28 @@ final class WaitingMonitor {
 
     // MARK: - opencode stalled (slow path, full scan)
 
-    private var ocLastStalledScan = Date.distantPast
     private func opencodeStalledSlowPath(threshold: TimeInterval, now: Date) -> Bool {
-        guard !ocPendingQuestions.isEmpty || !ocPendingPermissions.isEmpty || now.timeIntervalSince(ocLastStalledScan) > 30 else { return false }
+        guard WaitingDetector.processAlive(named: "opencode") else {
+            ocLastStalledResult = false
+            return false
+        }
+        guard !ocPendingQuestions.isEmpty || !ocPendingPermissions.isEmpty || now.timeIntervalSince(ocLastStalledScan) > 30 else {
+            if WaitingDetector.hasWorkerChild(parentPrefix: "opencode") {
+                ocLastStalledResult = false
+            }
+            return ocLastStalledResult
+        }
         ocLastStalledScan = now
-        guard WaitingDetector.processAlive(named: "opencode"),
-              let db = OpenCodeDB.shared() else { return false }
+        guard let db = OpenCodeDB.shared() else {
+            ocLastStalledResult = false
+            return false
+        }
 
         // A worker descendant (shell/interpreter/build tool) means a command
         // is executing, even if no part row was touched recently.
         if WaitingDetector.hasWorkerChild(parentPrefix: "opencode") {
             Diagnostics.debug("opencode stalled suppressed: worker child running")
+            ocLastStalledResult = false
             return false
         }
 
@@ -299,10 +313,11 @@ final class WaitingMonitor {
         let staleLower = Int64((now.addingTimeInterval(-1800)).timeIntervalSince1970 * 1000)
         try? db.query(
             "SELECT COUNT(*) FROM part WHERE time_updated < ? AND time_updated >= ? " +
-            "AND length(data) < 200000 AND data LIKE '%\"status\":\"running\"%'",
+            "AND data LIKE '%\"status\":\"running\"%'",
             binds: [.int(staleUpper), .int(staleLower)]
         ) { row in staleCount = Int(row.int(0)) }
-        return staleCount > 0
+        ocLastStalledResult = staleCount > 0
+        return ocLastStalledResult
     }
 }
 
@@ -329,8 +344,7 @@ enum WaitingDetector {
         let logURL = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".local/share/opencode/log/opencode.log")
         guard FileManager.default.fileExists(atPath: logURL.path) else { return nil }
-        let cutoff = now.addingTimeInterval(-86_400)
-        return FileResultCache.shared.value(for: logURL, namespace: "opencode_perm_log_oneshot") {
+        let latest: Date? = FileResultCache.shared.value(for: logURL, namespace: "opencode_perm_log_oneshot") {
             guard let handle = try? FileHandle(forReadingFrom: logURL) else { return nil as Date? }
             defer { try? handle.close() }
             let size = Int64((try? handle.seekToEnd()) ?? 0)
@@ -346,7 +360,6 @@ enum WaitingDetector {
                     if let end = after.firstIndex(of: " ") {
                         let tsStr = String(after[..<end])
                         if let date = Formatters.isoFractional.date(from: tsStr) ?? Formatters.isoPlain.date(from: tsStr) {
-                            if date < cutoff { continue }
                             if latest == nil || date > latest! { latest = date }
                         }
                     }
@@ -354,6 +367,7 @@ enum WaitingDetector {
             }
             return latest
         }
+        return latest.flatMap { $0 > now.addingTimeInterval(-86_400) ? $0 : nil }
     }
 
     private static func hasRunningOpencodePart(now: Date) -> Bool {
@@ -386,8 +400,8 @@ enum WaitingDetector {
 
         var questionCount = 0
         try? db.query(
-            "SELECT COUNT(*) FROM part WHERE length(data) < 50000 " +
-            "AND data LIKE '%\"tool\":\"question\"%' AND json_extract(data,'$.state.status')='running'",
+            "SELECT COUNT(*) FROM part WHERE " +
+            "data LIKE '%\"tool\":\"question\"%' AND json_extract(data,'$.state.status')='running'",
             binds: []
         ) { row in questionCount = Int(row.int(0)) }
         if questionCount > 0 { return .question }
@@ -402,8 +416,8 @@ enum WaitingDetector {
         }
         var permCount = 0
         try? db.query(
-            "SELECT COUNT(*) FROM part WHERE length(data) < 60000 " +
-            "AND data LIKE '%\"tool\":\"permission\"%' AND json_extract(data,'$.state.status')='running'",
+            "SELECT COUNT(*) FROM part WHERE " +
+            "data LIKE '%\"tool\":\"permission\"%' AND json_extract(data,'$.state.status')='running'",
             binds: []
         ) { row in permCount = Int(row.int(0)) }
         if permCount > 0 { return .permission }
@@ -416,7 +430,7 @@ enum WaitingDetector {
         let staleLower = Int64((now.addingTimeInterval(-1800)).timeIntervalSince1970 * 1000)
         try? db.query(
             "SELECT COUNT(*) FROM part WHERE time_updated < ? AND time_updated >= ? " +
-            "AND length(data) < 200000 AND data LIKE '%\"status\":\"running\"%'",
+            "AND data LIKE '%\"status\":\"running\"%'",
             binds: [.int(staleUpper), .int(staleLower)]
         ) { row in staleCount = Int(row.int(0)) }
         if staleCount > 0 { return .stalled }
@@ -562,17 +576,15 @@ enum WaitingDetector {
     }
 
     static func codexWaitingKind(threshold: TimeInterval, now: Date) -> WaitingKind? {
+        guard processAlive(named: "codex") else { return nil }
         let questionCutoff = now.addingTimeInterval(-86_400)
         let activeCutoff = now.addingTimeInterval(-600)
         let recentFiles = recentCodexFiles(questionCutoff: questionCutoff)
         guard !recentFiles.isEmpty else { return nil }
 
-        let candidates = recentFiles.prefix(8)
+        let candidates = recentFiles.prefix(32)
         if candidates.contains(where: { hasOpenRequestUserInput($0.0).question }) {
             return .question
-        }
-        if candidates.contains(where: { hasOpenPermissionRequest($0.0) }) {
-            return .permission
         }
 
         // A worker descendant (exec backend child) means a command is
@@ -649,74 +661,6 @@ enum WaitingDetector {
                 }
             }
             return (!pendingCallIDs.isEmpty, !pendingWaitIDs.isEmpty)
-        }
-    }
-
-    private static func hasOpenPermissionRequest(_ file: URL) -> Bool {
-        FileResultCache.shared.value(for: file, namespace: "codex_permission") {
-            guard let handle = try? FileHandle(forReadingFrom: file) else { return false }
-            defer { try? handle.close() }
-            let size = Int64((try? handle.seekToEnd()) ?? 0)
-            let readStart = max(0, size - 262_144)
-            try? handle.seek(toOffset: UInt64(readStart))
-            guard let data = try? handle.readToEnd(), !data.isEmpty else { return false }
-
-            // Fast reject if no permission-like token. NOTE: `apply_patch`
-            // is deliberately NOT here: per codex's own protocol it is a
-            // normal edit tool (Edit/Write), not an approval request.
-            // Treating it as permission flagged every patch application
-            // as "等你授权" while it was running.
-            let text = String(data: data, encoding: .utf8) ?? ""
-            let lower = text.lowercased()
-            guard lower.contains("permission") || lower.contains("approval") else { return false }
-
-            let outputMarker = Data("\"type\":\"function_call_output\"".utf8)
-            let taskEventMarker = Data("\"type\":\"task_".utf8)
-
-            var pendingCallIDs: Set<String> = []
-            for line in data.split(separator: 0x0A) {
-                // keep lines that could be permission-related
-                let lineLower = String(data: Data(line), encoding: .utf8)?.lowercased() ?? ""
-                let isPermLine = lineLower.contains("permission") || lineLower.contains("approval")
-                guard isPermLine || line.range(of: outputMarker) != nil || line.range(of: taskEventMarker) != nil else { continue }
-                guard let object = try? JSONSerialization.jsonObject(with: Data(line)),
-                      let envelope = object as? [String: Any],
-                      let payload = envelope["payload"] as? [String: Any] else { continue }
-
-                if envelope["type"] as? String == "event_msg",
-                   let eventType = payload["type"] as? String,
-                   ["task_started", "task_complete", "turn_aborted", "thread_rolled_back"].contains(eventType) {
-                    pendingCallIDs.removeAll()
-                    continue
-                }
-
-                guard envelope["type"] as? String == "response_item",
-                      let itemType = payload["type"] as? String,
-                      let callID = payload["call_id"] as? String else { continue }
-
-                if itemType == "function_call", let name = payload["name"] as? String {
-                    let n = name.lowercased()
-                    if n.contains("permission") || n.contains("approval") {
-                        pendingCallIDs.insert(callID)
-                    }
-                } else if itemType == "function_call_output" {
-                    pendingCallIDs.remove(callID)
-                }
-            }
-            if !pendingCallIDs.isEmpty { return true }
-            // Last resort: an explicit pending-approval STATE marker on a
-            // single line (e.g. "status":"pending_approval"). Same-line only:
-            // "approval" and "pending" pages apart is usually code or docs
-            // being edited, not a prompt for the user.
-            for line in text.split(separator: "\n") {
-                let l = line.lowercased()
-                guard l.contains("approval") && l.contains("pending") else { continue }
-                if l.contains("\"status\"") || l.contains("\"state\"")
-                    || l.contains("pending_approval") || l.contains("pending approval") {
-                    return true
-                }
-            }
-            return false
         }
     }
 

@@ -136,6 +136,26 @@ final class UsageStore {
         version += 1
     }
 
+    /// Replace contribution rows and cursor metadata atomically. A source can
+    /// safely advance its file/API cursor only in the same commit as the
+    /// corresponding usage rows; otherwise a crash between two writes would
+    /// replay the same usage on the next poll.
+    func batchUpsert(_ entries: [ContribEntry], meta: [String: String]) throws {
+        guard !entries.isEmpty || !meta.isEmpty else { return }
+        guard db != nil else { throw SQLiteError(message: "store unavailable") }
+        ioLock.lock()
+        defer { ioLock.unlock() }
+        try inTransaction {
+            for entry in entries {
+                try upsertRow(entry)
+            }
+            for (key, value) in meta {
+                try setMetaRow(key, value)
+            }
+        }
+        if !entries.isEmpty { version += 1 }
+    }
+
     func deleteAll(source: Tool) throws {
         guard let db else { throw SQLiteError(message: "store unavailable") }
         ioLock.lock()
@@ -293,9 +313,15 @@ final class UsageStore {
     }
 
     func setMeta(_ key: String, _ value: String) throws {
-        guard let db else { throw SQLiteError(message: "store unavailable") }
+        guard db != nil else { throw SQLiteError(message: "store unavailable") }
         ioLock.lock()
         defer { ioLock.unlock() }
+        try setMetaRow(key, value)
+    }
+
+    /// Caller must hold `ioLock`; used by transactions that already own it.
+    private func setMetaRow(_ key: String, _ value: String) throws {
+        guard let db else { throw SQLiteError(message: "store unavailable") }
         try db.query(
             "INSERT INTO meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             binds: [.text(key), .text(value)]

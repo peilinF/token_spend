@@ -77,6 +77,10 @@ final class PanelController: ObservableObject {
         let size = CircleView.fittedSize(scale: state.widgetScale, hasStrip: hasStrip)
         view.setFrameSize(size)
         circlePanel = makePanel(view, size: size)
+        // Newer macOS no longer starts movable-by-background drags on SwiftUI
+        // content (the hosting view claims the mouse-down). The circle owns
+        // its drag via DragGesture instead; see CircleView.windowDrag.
+        circlePanel.isMovableByWindowBackground = false
         if let saved = loadOrigin(key: "circle_origin") {
             circlePanel.setFrameTopLeftPoint(saved)
             ensureOnScreen()
@@ -233,6 +237,33 @@ final class PanelController: ObservableObject {
     }
 
     var isCircleVisible: Bool { circlePanel.isVisible }
+
+    /// Drag the circle panel so it follows the mouse 1:1. Geometry comes
+    /// from absolute screen coordinates (NSEvent.mouseLocation), never from
+    /// SwiftUI gesture values: the view is scaled (widgetScale), so gesture
+    /// translations arrive shrunk by 1/scale and the window would lag behind
+    /// the cursor. The gesture only signals "still dragging"; the anchor is
+    /// captured on its first event, so there is no jump.
+    private var dragWindowAnchor: NSPoint?
+    private var dragMouseAnchor: NSPoint?
+
+    func circleDragChanged() {
+        let mouse = NSEvent.mouseLocation
+        guard let windowAnchor = dragWindowAnchor, let mouseAnchor = dragMouseAnchor else {
+            dragWindowAnchor = circlePanel.frame.origin
+            dragMouseAnchor = mouse
+            return
+        }
+        circlePanel.setFrameOrigin(NSPoint(
+            x: windowAnchor.x + (mouse.x - mouseAnchor.x),
+            y: windowAnchor.y + (mouse.y - mouseAnchor.y)
+        ))
+    }
+
+    func circleDragEnded() {
+        dragWindowAnchor = nil
+        dragMouseAnchor = nil
+    }
 
     func toggleDetail() {
         if detailPanel.isVisible {

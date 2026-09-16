@@ -30,8 +30,10 @@ enum StoreKeys {
     static let cursorLastTs = "cursor_last_ts"
     static let cursorKeyV2 = "cursor_key_v2"
     static let cursorAccountId = "cursor_account_id"
+    static let codexUsageVersion = "codex_usage_version"
     static func codexSig(_ path: String) -> String { "codex_sig:" + path }
     static func codexOff(_ path: String) -> String { "codex_off:" + path }
+    static func codexBaseline(_ path: String) -> String { "codex_baseline:" + path }
 }
 
 /// Extension point for new tools (claude, gemini, …).
