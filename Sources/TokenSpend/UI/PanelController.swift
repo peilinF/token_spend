@@ -8,6 +8,14 @@ final class PanelWindow: NSPanel {
     override var canBecomeMain: Bool { false }
 }
 
+/// Hosting view for the circle panel. The panel is nonactivating and usually
+/// not key, so AppKit consumes the first mouse-down for activation and the
+/// SwiftUI press/drag gestures would only work from the second click on.
+/// Accepting first mouse restores press-and-drag on the very first click.
+final class CircleHostingView: NSHostingView<CircleView> {
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+}
+
 @MainActor
 final class PanelController: ObservableObject {
     static let shared = PanelController()
@@ -72,7 +80,7 @@ final class PanelController: ObservableObject {
     }
 
     private func setupCircle() {
-        let view = NSHostingView(rootView: CircleView(state: state, panel: self))
+        let view = CircleHostingView(rootView: CircleView(state: state, panel: self))
         let hasStrip = state.quotaDisplayMode == .always && (state.codexQuota != nil || state.cursorQuota != nil)
         let size = CircleView.fittedSize(scale: state.widgetScale, hasStrip: hasStrip)
         view.setFrameSize(size)
