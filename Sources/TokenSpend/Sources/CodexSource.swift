@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 
 enum CodexSource {
     static func isActive(within interval: TimeInterval) -> Bool {
@@ -48,37 +49,24 @@ enum CodexSource {
     }
 
     static func reconcile(store: UsageStore) throws {
-        listLock.lock()
-        listAt = .distantPast
-        listLock.unlock()
-        let sessionsDir = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".codex/sessions")
-        guard FileManager.default.fileExists(atPath: sessionsDir.path) else {
-            try store.deleteSourceKeysNotIn(source: .codex, validKeys: [])
-            return
+        try reconcile(store: store, sessionsDirectory: nil)
+    }
+
+    static func reconcile(store: UsageStore, sessionsDirectory: URL?) throws {
+        try withSourceWriteLock(store: store) {
+            try CodexV4Engine.reconcile(store: store, sessionsDirectory: sessionsDirectory)
         }
-        let paths = Set(sessionFiles().map(\.url.path))
-        let keys = store.keysForSource(source: .codex)
-        var valid = Set<String>()
-        for key in keys {
-            guard let idx = key.firstIndex(of: "|") else { continue }
-            if paths.contains(String(key[..<idx])) {
-                valid.insert(key)
-            }
-        }
-        try store.deleteSourceKeysNotIn(source: .codex, validKeys: valid)
     }
 
     private static let listLock = NSLock()
+    private static let refreshLock = NSLock()
     private static var listAt = Date.distantPast
     private static var listedFiles: [(url: URL, mtime: Date)] = []
 
     /// `last_token_usage` is a snapshot emitted repeatedly while a turn is
     /// running. The cumulative field is the only safe source for totals;
     /// summing every snapshot double-counts repeated progress events.
-    private static let usageParserVersion = "2"
-
-    private struct UsageSnapshot: Equatable {
+    struct UsageSnapshot: Equatable {
         var input: Int64
         var output: Int64
         var cacheRead: Int64
@@ -137,91 +125,51 @@ enum CodexSource {
         sessionFiles().max(by: { $0.mtime < $1.mtime })?.url
     }
 
-    static func refresh(store: UsageStore) throws {
-        try migrateUsageIfNeeded(store: store)
-        var best: (json: [String: Any], ts: Double)?
-        for file in sessionFiles().map(\.url).sorted(by: { $0.path < $1.path }) {
-            let attrs = (try? FileManager.default.attributesOfItem(atPath: file.path)) ?? [:]
-            // File dates can stringify with a different binary-floating-point
-            // tail on each read. Millisecond precision is enough for the
-            // cursor and makes a quiet file truly idempotent.
-            let mtime = Int64((((attrs[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0) * 1000).rounded())
-            let size = (attrs[.size] as? NSNumber)?.int64Value ?? 0
-            let inode = (attrs[.systemFileNumber] as? NSNumber)?.int64Value ?? 0
-            // inode disambiguates same-size in-place rewrites; mtime-only
-            // bumps with identical size+offset are touches, not new data.
-            let sig = "\(inode)|\(mtime)|\(size)"
-            let sigKey = StoreKeys.codexSig(file.path)
-            let offKey = StoreKeys.codexOff(file.path)
-            if store.meta(sigKey) == sig { continue }
-            let prevSig = store.meta(sigKey)
-            let prevInode = prevSig?.split(separator: "|").first.map(String.init)
-
-            var startOffset = Int64(store.meta(offKey) ?? "0") ?? 0
-            var baseline = UsageSnapshot.decode(store.meta(StoreKeys.codexBaseline(file.path)))
-            if startOffset > size || startOffset < 0 || (prevInode != nil && prevInode != String(inode)) {
-                // Truncated, rotated or replaced: old per-day aggregates are
-                // invalid, so rescan from zero after the replacement file has
-                // been read successfully. Delaying deletion preserves the
-                // last good values through a transient read failure.
-                startOffset = 0
-                baseline = nil
-            } else if startOffset == size, size > 0 {
-                // Same size, same file, offset at EOF: mtime touch, no new
-                // data. Just record the signature and skip the parse.
-                try store.setMeta(sigKey, sig)
-                continue
-            }
-
-            if startOffset == 0 { baseline = nil }
-            let (chunk, newOffset, rateLimits, newBaseline, didRead) = parseChunk(
-                file, from: startOffset, baseline: baseline
-            )
-            guard didRead else {
-                // Do not delete existing rows or advance the cursor when a
-                // transient file-open/read failure occurs. The next poll can
-                // retry the same byte range without losing usage.
-                continue
-            }
-            if let rateLimits, best == nil || rateLimits.ts > best!.ts {
-                best = rateLimits
-            }
-
-            if startOffset == 0 {
-                try store.deleteSourceKeys(source: .codex, keyPrefix: file.path + "|")
-            }
-            if !chunk.isEmpty {
-                var merged: [String: UsageAmount] = [:]
-                for (key, amount) in store.amountsForSource(source: .codex, keyPrefix: file.path + "|") {
-                    let day = String(key.dropFirst(file.path.count + 1))
-                    merged[day] = amount
-                }
-                for (day, delta) in chunk {
-                    merged[day, default: .zero] = merged[day, default: .zero] + delta
-                }
-                // One transaction per file instead of one fsync per day-row.
-                let entries = merged.map { day, amount in
-                    ContribEntry(source: .codex, key: file.path + "|" + day, day: day, amount: amount)
-                }
-                var meta: [String: String] = [offKey: String(newOffset), sigKey: sig]
-                if let newBaseline {
-                    meta[StoreKeys.codexBaseline(file.path)] = newBaseline.encoded
-                }
-                try store.batchUpsert(entries, meta: meta)
-            } else {
-                var meta: [String: String] = [offKey: String(newOffset), sigKey: sig]
-                if let newBaseline {
-                    meta[StoreKeys.codexBaseline(file.path)] = newBaseline.encoded
-                }
-                try store.batchUpsert([], meta: meta)
+    static func refresh(store: UsageStore, sessionsDirectory: URL? = nil, backupURL: URL? = nil) throws {
+        try withSourceWriteLock(store: store) {
+            // Capture this before parsing new events: merging even a short-only
+            // snapshot stamps a legacy retained window with its old baseline,
+            // which otherwise hides that the cache still needs a raw-tail repair.
+            let needsLegacyRateRepair = hasLegacyRateRecords(store)
+            // Initial repair can take longer than the live polling interval.
+            // Serialize cursors and deltas so overlapping polls cannot replay them.
+            let best = try CodexV4Engine.refresh(store: store, sessionsDirectory: sessionsDirectory, backupURL: backupURL)
+            if let best { try persistRateLimits(best.json, observedTs: best.ts, store: store) }
+            let hasLegacyAfterMerge = hasLegacyRateRecords(store)
+            let shouldPrimeForMissingQuota = sessionsDirectory == nil && !hasUsableRateLimits(store)
+            if shouldPrimeForMissingQuota || needsLegacyRateRepair || hasLegacyAfterMerge {
+                try primeRateLimits(store: store, sessionsDirectory: sessionsDirectory)
             }
         }
-        if let best {
-            try persistRateLimits(best.json, observedTs: best.ts, store: store)
+    }
+
+    /// Interprocess lock shared by refresh and reconcile for the same store.
+    /// Audit is intentionally read-only and never calls this helper.
+    static func withDatabaseFileLock<T>(databaseURL: URL, operation: () throws -> T) throws -> T {
+        let lockURL = URL(fileURLWithPath: databaseURL.path + ".codex.lock")
+        let descriptor = lockURL.path.withCString {
+            Darwin.open($0, O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, mode_t(0o600))
         }
-        if !hasUsableRateLimits(store) || hasLegacyRateRecords(store) {
-            try primeRateLimits(store: store)
+        guard descriptor >= 0 else {
+            throw SQLiteError(message: "cannot open Codex source lock \(lockURL.path) (errno \(errno))")
         }
+        defer { _ = Darwin.close(descriptor) }
+        guard Darwin.fchmod(descriptor, mode_t(0o600)) == 0 else {
+            throw SQLiteError(message: "cannot set owner-only permissions on Codex source lock \(lockURL.path) (errno \(errno))")
+        }
+        while flock(descriptor, LOCK_EX) != 0 {
+            let code = errno
+            if code == EINTR { continue }
+            throw SQLiteError(message: "cannot acquire Codex source lock \(lockURL.path) (errno \(code))")
+        }
+        defer { _ = flock(descriptor, LOCK_UN) }
+        return try operation()
+    }
+
+    private static func withSourceWriteLock<T>(store: UsageStore, operation: () throws -> T) throws -> T {
+        refreshLock.lock()
+        defer { refreshLock.unlock() }
+        return try withDatabaseFileLock(databaseURL: store.fileURL, operation: operation)
     }
 
     /// One-time adoption: pre-merge stored payloads lack `observed_ts`/slots.
@@ -232,7 +180,13 @@ enum CodexSource {
               let data = raw.data(using: .utf8),
               let map = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return false }
         if map["limit_id"] != nil || map["used_percent"] != nil { return true }
-        return map.values.contains { ($0 as? [String: Any])?["observed_ts"] == nil }
+        return map.values.contains { value in
+            guard let record = value as? [String: Any] else { return false }
+            let (short, long) = CodexQuota.slots(of: record)
+            return [short, long].compactMap { $0 }.contains { window in
+                (window["observed_ts"] as? NSNumber) == nil
+            }
+        }
     }
 
     // Rate-limit snapshots ride along on token_count events; primary is the
@@ -248,6 +202,12 @@ enum CodexSource {
 
     private static let primeLock = NSLock()
     private static var lastPrimeAt = Date.distantPast
+
+    static func resetRatePrimeThrottleForTesting() {
+        primeLock.lock()
+        lastPrimeAt = .distantPast
+        primeLock.unlock()
+    }
 
     private static func persistRateLimits(_ json: [String: Any], observedTs: Double, store: UsageStore) throws {
         // One merged record per limit family; windows merge per kind so a
@@ -279,29 +239,15 @@ enum CodexSource {
         CodexQuota.decode(fromJSON: store.meta(StoreKeys.codexRateLimits)) != nil
     }
 
-    /// Existing versions summed repeated `last_token_usage` snapshots. Clear
-    /// only Codex contribution rows once, then rebuild from the source logs
-    /// using cumulative deltas. This is intentionally versioned so a future
-    /// parser change can repeat the repair without touching other tools.
-    private static func migrateUsageIfNeeded(store: UsageStore) throws {
-        guard store.meta(StoreKeys.codexUsageVersion) != usageParserVersion else { return }
-        try store.deleteAll(source: .codex)
-        for file in sessionFiles() {
-            try store.setMeta(StoreKeys.codexOff(file.url.path), "0")
-            try store.setMeta(StoreKeys.codexSig(file.url.path), "")
-            try store.setMeta(StoreKeys.codexBaseline(file.url.path), "")
-        }
-        try store.setMeta(StoreKeys.codexUsageVersion, usageParserVersion)
-    }
-
     // First launch after this feature ships: no incremental lines may arrive
     // for a while, so pull recent snapshots straight from the newest tail.
-    private static func primeRateLimits(store: UsageStore) throws {
+    private static func primeRateLimits(store: UsageStore, sessionsDirectory: URL?) throws {
         primeLock.lock()
         defer { primeLock.unlock() }
         guard Date().timeIntervalSince(lastPrimeAt) > 60 else { return }
         lastPrimeAt = Date()
-        guard let file = newestSessionFile(),
+        let newest = sessionsDirectory.map(newestSessionFile(in:)) ?? newestSessionFile()
+        guard let file = newest,
               let handle = try? FileHandle(forReadingFrom: file) else { return }
         defer { try? handle.close() }
         let size = Int64((try? handle.seekToEnd()) ?? 0)
@@ -339,7 +285,22 @@ enum CodexSource {
         try store.setMeta(StoreKeys.codexRateLimits, raw)
     }
 
-    private static func parseChunk(
+    private static func newestSessionFile(in directory: URL) -> URL? {
+        var newest: (url: URL, modifiedAt: Date)?
+        guard let enumerator = FileManager.default.enumerator(
+            at: directory, includingPropertiesForKeys: [.isRegularFileKey, .contentModificationDateKey]
+        ) else { return nil }
+        while let url = enumerator.nextObject() as? URL {
+            guard url.pathExtension == "jsonl",
+                  let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .contentModificationDateKey]),
+                  values.isRegularFile == true,
+                  let modifiedAt = values.contentModificationDate else { continue }
+            if newest == nil || modifiedAt > newest!.modifiedAt { newest = (url, modifiedAt) }
+        }
+        return newest?.url
+    }
+
+    static func parseChunk(
         _ file: URL,
         from offset: Int64,
         baseline: UsageSnapshot?
@@ -403,33 +364,24 @@ enum CodexSource {
               let info = payload["info"] as? [String: Any] else { return }
 
         var amount: UsageAmount
-        if let total = info["total_token_usage"] as? [String: Any] {
-            let current = UsageSnapshot(
-                input: toInt64(total["input_tokens"]),
-                output: toInt64(total["output_tokens"]),
-                cacheRead: toInt64(total["cached_input_tokens"]),
-                cacheWrite: toInt64(total["cache_write_input_tokens"])
-            )
+        if let current = snapshot(info["total_token_usage"] as? [String: Any]) {
             if let previous = baseline {
                 let delta = current.amount - previous.amount
-                // A new task/context can reset the cumulative counter. Count
-                // the new segment from zero instead of producing negatives.
+                // A reset/resumed segment may inherit historical usage too.
+                // Only the latest request belongs to this first observation.
                 amount = delta.input < 0 || delta.output < 0
                     || delta.cacheRead < 0 || delta.cacheWrite < 0
-                    ? current.amount : delta
+                    ? snapshot(info["last_token_usage"] as? [String: Any])?.amount ?? current.amount : delta
             } else {
-                amount = current.amount
+                // A resumed session file can start with a huge inherited
+                // cumulative total. Its last request is the new usage here.
+                amount = snapshot(info["last_token_usage"] as? [String: Any])?.amount ?? current.amount
             }
             baseline = current
-        } else if let usage = info["last_token_usage"] as? [String: Any] {
+        } else if let usage = snapshot(info["last_token_usage"] as? [String: Any]) {
             // Compatibility fallback for older Codex logs that do not expose
             // the cumulative snapshot. These values are per-event usage.
-            amount = UsageAmount(
-                input: toInt64(usage["input_tokens"]),
-                output: toInt64(usage["output_tokens"]),
-                cacheRead: toInt64(usage["cached_input_tokens"]),
-                cacheWrite: toInt64(usage["cache_write_input_tokens"])
-            )
+            amount = usage.amount
         } else {
             return
         }
@@ -437,6 +389,10 @@ enum CodexSource {
               amount.cacheRead >= 0, amount.cacheWrite >= 0,
               amount.input != 0 || amount.output != 0
                 || amount.cacheRead != 0 || amount.cacheWrite != 0 else { return }
+
+        // Codex input_tokens already includes cached_input_tokens. Our store
+        // uses exclusive buckets so lean excludes cache and full adds it once.
+        amount.input = max(0, amount.input - amount.cacheRead - amount.cacheWrite)
 
         let day: String
         if let ts = obj["timestamp"] as? String, let date = parseTimestamp(ts) {
@@ -449,6 +405,16 @@ enum CodexSource {
 
     private static func parseLine(_ data: Data) -> [String: Any]? {
         (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+    }
+
+    private static func snapshot(_ usage: [String: Any]?) -> UsageSnapshot? {
+        guard let usage else { return nil }
+        return UsageSnapshot(
+            input: toInt64(usage["input_tokens"]),
+            output: toInt64(usage["output_tokens"]),
+            cacheRead: toInt64(usage["cached_input_tokens"]),
+            cacheWrite: toInt64(usage["cache_write_input_tokens"])
+        )
     }
 
     private static func parseTimestamp(_ s: String) -> Date? {

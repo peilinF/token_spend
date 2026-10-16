@@ -83,12 +83,27 @@ enum CursorLogs {
                     includingPropertiesForKeys: [.isRegularFileKey, .contentModificationDateKey],
                     options: [.skipsHiddenFiles]
                 ) else { continue }
-                for out in outputs {
-                    let candidate = out.appendingPathComponent(fileName)
+
+                func appendCandidate(_ dir: URL) {
+                    let candidate = dir.appendingPathComponent(fileName)
                     let values = try? candidate.resourceValues(forKeys: [.isRegularFileKey, .contentModificationDateKey])
-                    guard values?.isRegularFile == true else { continue }
+                    guard values?.isRegularFile == true else { return }
                     let mtime = values?.contentModificationDate?.timeIntervalSince1970 ?? 0
                     found.append((candidate, mtime))
+                }
+
+                for out in outputs {
+                    appendCandidate(out)
+                    // Newer Cursor nests extension logs one level deeper, e.g.
+                    // window2/exthost/anysphere.cursor-agent-exec/Cursor Agent Exec.log
+                    if out.lastPathComponent == "exthost",
+                       let subs = try? fm.contentsOfDirectory(
+                           at: out,
+                           includingPropertiesForKeys: [.isDirectoryKey],
+                           options: [.skipsHiddenFiles]
+                       ) {
+                        for sub in subs { appendCandidate(sub) }
+                    }
                 }
             }
         }

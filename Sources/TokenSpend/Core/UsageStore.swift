@@ -15,6 +15,7 @@ final class UsageStore {
 
     private let db: SQLiteDatabase?
     private let ioLock = NSLock()
+    let fileURL: URL
     private var version = 0
 
     // Bumped only by contrib writes; meta writes do not count, so poll loops
@@ -31,16 +32,20 @@ final class UsageStore {
         return base.appendingPathComponent("TokenSpend", isDirectory: true)
     }
 
-    init() {
-        let url = Self.dir.appendingPathComponent("store.db")
+    static var databaseURL: URL { dir.appendingPathComponent("store.db") }
+
+    init(databaseURL: URL? = nil) {
+        let url = databaseURL ?? Self.databaseURL
+        fileURL = url
+        let directory = url.deletingLastPathComponent()
         var created: SQLiteDatabase?
         do {
             try FileManager.default.createDirectory(
-                at: Self.dir, withIntermediateDirectories: true,
+                at: directory, withIntermediateDirectories: true,
                 attributes: [.posixPermissions: 0o700]
             )
             // Repair permissions on pre-existing installs.
-            try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: Self.dir.path)
+            try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
             created = try SQLiteDatabase(path: url.path)
             try Self.setup(db: created!)
             // Token/quota/account data: owner-only.
@@ -226,6 +231,17 @@ final class UsageStore {
         return keys
     }
 
+    func keysForSourceThrowing(source: Tool) throws -> [String] {
+        guard let db else { throw SQLiteError(message: "store unavailable") }
+        ioLock.lock()
+        defer { ioLock.unlock() }
+        var keys: [String] = []
+        try db.query("SELECT key FROM contrib WHERE source=?", binds: [.text(source.rawValue)]) { row in
+            if let key = row.text(0) { keys.append(key) }
+        }
+        return keys
+    }
+
     func dailyTotals(sinceDay: String) -> [Tool: [String: UsageAmount]] {
         guard let db else { return [:] }
         ioLock.lock()
@@ -325,6 +341,166 @@ final class UsageStore {
         try db.query(
             "INSERT INTO meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             binds: [.text(key), .text(value)]
+        ) { _ in }
+    }
+
+    // MARK: - Codex rebuild and isolated audit support
+
+    func metaThrowing(_ key: String) throws -> String? {
+        guard let db else { throw SQLiteError(message: "store unavailable") }
+        ioLock.lock()
+        defer { ioLock.unlock() }
+        var value: String?
+        try db.query("SELECT value FROM meta WHERE key=?", binds: [.text(key)]) { row in
+            value = row.text(0)
+        }
+        return value
+    }
+
+    func metadataThrowing(prefix: String) throws -> [String: String] {
+        guard let db else { throw SQLiteError(message: "store unavailable") }
+        ioLock.lock()
+        defer { ioLock.unlock() }
+        var values: [String: String] = [:]
+        try db.query(
+            "SELECT key, value FROM meta WHERE substr(key,1,length(?))=?",
+            binds: [.text(prefix), .text(prefix)]
+        ) { row in
+            if let key = row.text(0), let value = row.text(1) { values[key] = value }
+        }
+        return values
+    }
+
+    func amountsForSourceThrowing(source: Tool, keyPrefix: String) throws -> [String: UsageAmount] {
+        guard let db else { throw SQLiteError(message: "store unavailable") }
+        ioLock.lock()
+        defer { ioLock.unlock() }
+        var result: [String: UsageAmount] = [:]
+        let escaped = keyPrefix
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "%", with: "\\%")
+            .replacingOccurrences(of: "_", with: "\\_")
+        try db.query(
+            "SELECT key, input, output, cache_read, cache_write, cost FROM contrib " +
+            "WHERE source=? AND key LIKE ? ESCAPE '\\'",
+            binds: [.text(source.rawValue), .text(escaped + "%")]
+        ) { row in
+            guard let key = row.text(0) else { return }
+            var amount = UsageAmount()
+            amount.input = row.int(1)
+            amount.output = row.int(2)
+            amount.cacheRead = row.int(3)
+            amount.cacheWrite = row.int(4)
+            amount.cost = row.double(5)
+            result[key] = amount
+        }
+        return result
+    }
+
+    func backup(to url: URL) throws {
+        guard let db else { throw SQLiteError(message: "store unavailable") }
+        ioLock.lock()
+        defer { ioLock.unlock() }
+        try db.backup(to: url.path)
+    }
+
+    /// Apply replacements, additive rows, and cursor metadata in one commit.
+    /// Prefix deletion uses SQLite string functions rather than LIKE so file
+    /// paths containing `|`, `%`, or `_` remain exact.
+    func applySourceChanges(
+        source: Tool,
+        replacingKeyPrefixes: [String] = [],
+        replacementEntries: [ContribEntry] = [],
+        additiveEntries: [ContribEntry] = [],
+        metadataPrefixesToDelete: [String] = [],
+        metadataKeysToDelete: [String] = [],
+        meta: [String: String] = [:]
+    ) throws {
+        try applySourceChanges(
+            source: source, replaceAll: false,
+            replacingKeyPrefixes: replacingKeyPrefixes,
+            replacementEntries: replacementEntries,
+            additiveEntries: additiveEntries,
+            metadataPrefixesToDelete: metadataPrefixesToDelete,
+            metadataKeysToDelete: metadataKeysToDelete,
+            meta: meta
+        )
+    }
+
+    /// Atomically replace one source's rows and selected metadata. Other
+    /// sources and unrelated metadata are preserved.
+    func replaceSource(
+        source: Tool,
+        entries: [ContribEntry],
+        metadataPrefixesToDelete: [String],
+        metadataKeysToDelete: [String] = [],
+        meta: [String: String]
+    ) throws {
+        try applySourceChanges(
+            source: source, replaceAll: true,
+            replacingKeyPrefixes: [], replacementEntries: entries,
+            additiveEntries: [], metadataPrefixesToDelete: metadataPrefixesToDelete,
+            metadataKeysToDelete: metadataKeysToDelete,
+            meta: meta
+        )
+    }
+
+    private func applySourceChanges(
+        source: Tool,
+        replaceAll: Bool,
+        replacingKeyPrefixes: [String],
+        replacementEntries: [ContribEntry],
+        additiveEntries: [ContribEntry],
+        metadataPrefixesToDelete: [String],
+        metadataKeysToDelete: [String] = [],
+        meta: [String: String]
+    ) throws {
+        guard replaceAll || !replacingKeyPrefixes.isEmpty || !replacementEntries.isEmpty
+            || !additiveEntries.isEmpty || !metadataPrefixesToDelete.isEmpty
+            || !metadataKeysToDelete.isEmpty || !meta.isEmpty else { return }
+        guard let db else { throw SQLiteError(message: "store unavailable") }
+        ioLock.lock()
+        defer { ioLock.unlock() }
+        try inTransaction {
+            if replaceAll {
+                try db.query("DELETE FROM contrib WHERE source=?", binds: [.text(source.rawValue)]) { _ in }
+            }
+            for prefix in replacingKeyPrefixes {
+                try db.query(
+                    "DELETE FROM contrib WHERE source=? AND substr(key,1,length(?))=?",
+                    binds: [.text(source.rawValue), .text(prefix), .text(prefix)]
+                ) { _ in }
+            }
+            for prefix in metadataPrefixesToDelete {
+                try db.query(
+                    "DELETE FROM meta WHERE substr(key,1,length(?))=?",
+                    binds: [.text(prefix), .text(prefix)]
+                ) { _ in }
+            }
+            for key in metadataKeysToDelete {
+                try db.query("DELETE FROM meta WHERE key=?", binds: [.text(key)]) { _ in }
+            }
+            for entry in replacementEntries { try upsertRow(entry) }
+            for entry in additiveEntries { try addRow(entry) }
+            for (key, value) in meta { try setMetaRow(key, value) }
+        }
+        if replaceAll || !replacingKeyPrefixes.isEmpty || !replacementEntries.isEmpty || !additiveEntries.isEmpty {
+            version += 1
+        }
+    }
+
+    private func addRow(_ entry: ContribEntry) throws {
+        guard let db else { throw SQLiteError(message: "store unavailable") }
+        try db.query(
+            "INSERT INTO contrib(source,key,day,input,output,cache_read,cache_write,cost) VALUES(?,?,?,?,?,?,?,?) " +
+            "ON CONFLICT(source,key) DO UPDATE SET day=excluded.day, " +
+            "input=contrib.input+excluded.input, output=contrib.output+excluded.output, " +
+            "cache_read=contrib.cache_read+excluded.cache_read, " +
+            "cache_write=contrib.cache_write+excluded.cache_write, cost=contrib.cost+excluded.cost",
+            binds: [.text(entry.source.rawValue), .text(entry.key), .text(entry.day),
+                    .int(entry.amount.input), .int(entry.amount.output),
+                    .int(entry.amount.cacheRead), .int(entry.amount.cacheWrite),
+                    .double(entry.amount.cost)]
         ) { _ in }
     }
 }

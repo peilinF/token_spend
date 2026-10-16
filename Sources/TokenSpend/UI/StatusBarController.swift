@@ -54,12 +54,13 @@ final class StatusBarController {
         var parts: [String] = []
         if let quota = state.codexQuota {
             var windows: [String] = []
-            if let primary = quota.primary { windows.append("\(primary.shortLabel)剩\(Int(primary.leftPercent))%") }
-            if let secondary = quota.secondary { windows.append("\(secondary.shortLabel)剩\(Int(secondary.leftPercent))%") }
+            if let primary = quota.primary { windows.append("\(primary.shortLabel)剩\(Fmt.percent(primary.leftPercent))%") }
+            if let secondary = quota.secondary { windows.append("\(secondary.shortLabel)剩\(Fmt.percent(secondary.leftPercent))%") }
             if !windows.isEmpty { parts.append("codex " + windows.joined(separator: "/")) }
         }
         if let quota = state.cursorQuota, let total = quota.totalPercentUsed {
-            parts.append("cursor 月度已用\(Int(total))%")
+            let label = quota.isUnified ? "Cursor 共享周已用" : "cursor 月度已用"
+            parts.append("\(label)\(Fmt.percent(total))%")
         }
         return parts.isEmpty ? nil : parts.joined(separator: " · ")
     }

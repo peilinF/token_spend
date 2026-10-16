@@ -1,4 +1,5 @@
 import Foundation
+import CoreFoundation
 
 enum Tool: String, CaseIterable, Codable {
     case opencode
@@ -27,8 +28,8 @@ enum UsageMode: String, CaseIterable, Codable {
 
     var explanation: String {
         switch self {
-        case .lean: return "input(不含cache) + output"
-        case .full: return "含 cache read/write"
+        case .lean: return "不含缓存的输入 + 输出"
+        case .full: return "含缓存的输入 + 输出"
         }
     }
 }
@@ -240,12 +241,13 @@ struct CodexQuota: Equatable {
             }
         for record in records {
             let (short, long) = slots(of: record)
-            let observed = (record["observed_ts"] as? NSNumber)?.doubleValue ?? 0
+            let recordObserved = (record["observed_ts"] as? NSNumber)?.doubleValue ?? 0
             // A window whose reset passed AND the server has spoken since is
             // definitively stale (e.g. the plan dropped the 5h window).
             // Without a newer observation we keep showing it (offline case).
             func fresh(_ w: [String: Any]?) -> QuotaWindow? {
                 guard let w, let q = decodeWindow(w) else { return nil }
+                let observed = (w["observed_ts"] as? NSNumber)?.doubleValue ?? recordObserved
                 if let r = q.resetsAt, observed > 0,
                    r.timeIntervalSince1970 < now, observed > r.timeIntervalSince1970 {
                     return nil
@@ -263,29 +265,45 @@ struct CodexQuota: Equatable {
     }
 
     /// Merge an incoming server snapshot into a stored per-family record.
-    /// Windows merge per kind (short/long) with monotonic resets_at, so a
-    /// late-arriving older-shaped event can never clobber a fresher window,
-    /// and a missing kind keeps the stored value until it goes stale.
+    /// Windows merge per kind (short/long) by their own observation times.
+    /// Reset timestamps can jitter or move backwards when the server refreshes
+    /// a window, so they do not establish which snapshot is newer.
     /// Pure function (no I/O) so it stays unit-testable.
     static func mergeRateSnapshot(stored record: [String: Any], with incoming: [String: Any], observedTs: Double) -> [String: Any] {
         let (sShort, sLong) = slots(of: record)
         let (iShort, iLong) = slots(of: incoming)
+        let storedRecordObserved = (record["observed_ts"] as? NSNumber)?.doubleValue ?? 0
+        let incomingRecordObserved = max(
+            observedTs, (incoming["observed_ts"] as? NSNumber)?.doubleValue ?? 0
+        )
+        func observation(_ window: [String: Any], fallback: Double) -> Double {
+            (window["observed_ts"] as? NSNumber)?.doubleValue ?? fallback
+        }
+        func stamped(_ window: [String: Any], at timestamp: Double) -> [String: Any] {
+            var result = window
+            result["observed_ts"] = timestamp
+            return result
+        }
         func pick(_ s: [String: Any]?, _ i: [String: Any]?) -> [String: Any]? {
-            guard let i else { return s }
-            guard let s else { return i }
-            let ri = resetsAt(i), rs = resetsAt(s)
-            // The server re-emits one logical window with resets_at jitter
-            // of a few seconds (observed up to ~8s). A strictly-monotonic
-            // compare lets a single outlier with resets_at seconds higher
-            // block every fresher update for the whole window, so near-equal
-            // resets count as the same window and the newer observation
-            // wins; only a clearly later resets_at (the next window) also
-            // wins, keeping the old anti-clobber guarantee.
-            if abs(ri - rs) <= 120 { return i }
-            return ri > rs ? i : s
+            guard let s else {
+                return i.map { stamped($0, at: observation($0, fallback: incomingRecordObserved)) }
+            }
+            let storedObserved = observation(s, fallback: storedRecordObserved)
+            guard let i else {
+                // Even a missing incoming kind gets an explicit baseline so a
+                // short-window update cannot make the retained long window
+                // appear to have been observed at the record's newer time.
+                return stamped(s, at: storedObserved)
+            }
+            let incomingObserved = observation(i, fallback: incomingRecordObserved)
+            // Equal timestamps deliberately choose the incoming value. The
+            // newest raw snapshot can repair a stale persisted slot in place.
+            return incomingObserved >= storedObserved
+                ? stamped(i, at: incomingObserved)
+                : stamped(s, at: storedObserved)
         }
         var out: [String: Any] = [
-            "observed_ts": max((record["observed_ts"] as? NSNumber)?.doubleValue ?? 0, observedTs)
+            "observed_ts": max(storedRecordObserved, incomingRecordObserved)
         ]
         if let w = pick(sShort, iShort) { out["short"] = w }
         if let w = pick(sLong, iLong) { out["long"] = w }
@@ -304,7 +322,7 @@ struct CodexQuota: Equatable {
     /// "short"/"long" slots; legacy raw server payloads use
     /// "primary"/"secondary" (classified by duration, not position).
     static func slots(of record: [String: Any]) -> (short: [String: Any]?, long: [String: Any]?) {
-        if record["observed_ts"] != nil || record["short"] != nil || record["long"] != nil {
+        if record["short"] != nil || record["long"] != nil {
             return (asWindowDict(record["short"]), asWindowDict(record["long"]))
         }
         var short: [String: Any]?, long: [String: Any]?
@@ -335,10 +353,6 @@ struct CodexQuota: Equatable {
         (w["window_minutes"] as? NSNumber)?.intValue
     }
 
-    private static func resetsAt(_ w: [String: Any]) -> Double {
-        (w["resets_at"] as? NSNumber)?.doubleValue ?? 0
-    }
-
     /// Short = sub-day window; unknown durations fall back to position.
     private static func isShort(_ w: [String: Any], positionalShort: Bool) -> Bool {
         if let m = windowMinutes(w) { return m < 1440 }
@@ -360,6 +374,12 @@ struct CodexQuota: Equatable {
 }
 
 struct CursorQuota: Equatable {
+    enum PeriodKind: Equatable {
+        case monthly
+        case unifiedWeekly
+    }
+
+    var periodKind: PeriodKind
     var cycleStart: Date?
     var cycleEnd: Date?
     var totalPercentUsed: Double?
@@ -369,21 +389,66 @@ struct CursorQuota: Equatable {
     var limit: Int64?
     var bonus: Int64?
 
+    var isUnified: Bool { periodKind == .unifiedWeekly }
+    var periodLabel: String { isUnified ? "共享周额度" : "月度额度" }
+    var compactLabel: String { isUnified ? "共享" : "月度" }
+    var usageLabel: String { isUnified ? "共享周额度" : "Cursor 月度额度" }
+    var sharedToolsDescription: String? { isUnified ? "Cursor、Grok、Grok Bot 共用" : nil }
+    var leftPercent: Double? { totalPercentUsed.map { max(0, min(100, 100 - $0)) } }
+
     static func decode(fromJSON raw: String?) -> CursorQuota? {
         guard let raw, let data = raw.data(using: .utf8),
               let o = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return nil }
+
+        if unifiedFlag(in: o) == true {
+            guard let usedPercent = number(o["usagePercent"]), usedPercent.isFinite,
+                  usedPercent >= 0 else { return nil }
+            return CursorQuota(
+                periodKind: .unifiedWeekly,
+                cycleStart: date(o["currentPeriodStart"]),
+                cycleEnd: date(o["nextResetTimestampUtc"]),
+                totalPercentUsed: usedPercent,
+                autoPercentUsed: nil,
+                apiPercentUsed: nil,
+                used: nil,
+                limit: nil,
+                bonus: nil
+            )
+        }
+
+        if let plan = (o["planUsage"] as? [String: Any]) ?? (o["plan_usage"] as? [String: Any]) {
+            func value(_ camel: String, _ snake: String) -> Any? { plan[camel] ?? plan[snake] }
+            var quota = CursorQuota(
+                periodKind: .monthly,
+                cycleStart: date(o["billingCycleStart"] ?? o["billing_cycle_start"]),
+                cycleEnd: date(o["billingCycleEnd"] ?? o["billing_cycle_end"]),
+                totalPercentUsed: number(value("totalPercentUsed", "total_percent_used")),
+                autoPercentUsed: number(value("autoPercentUsed", "auto_percent_used")),
+                apiPercentUsed: number(value("apiPercentUsed", "api_percent_used")),
+                used: integer(value("totalSpend", "total_spend")),
+                limit: integer(value("limit", "limit")),
+                bonus: integer(value("bonusSpend", "bonus_spend"))
+            )
+            if quota.totalPercentUsed == nil,
+               let fallback = quota.autoPercentUsed ?? quota.apiPercentUsed {
+                quota.totalPercentUsed = fallback
+            }
+            guard quota.totalPercentUsed != nil || quota.autoPercentUsed != nil || quota.apiPercentUsed != nil else {
+                return nil
+            }
+            return quota
+        }
+
         guard let plan = (o["individualUsage"] as? [String: Any])?["plan"] as? [String: Any] else { return nil }
         let breakdown = plan["breakdown"] as? [String: Any]
 
         func pct(_ key: String) -> Double? {
-            (plan[key] as? NSNumber)?.doubleValue
-        }
-        func date(_ key: String) -> Date? {
-            (o[key] as? String).flatMap { Formatters.isoFractional.date(from: $0) }
+            number(plan[key])
         }
         var quota = CursorQuota(
-            cycleStart: date("billingCycleStart"),
-            cycleEnd: date("billingCycleEnd"),
+            periodKind: .monthly,
+            cycleStart: date(o["billingCycleStart"]),
+            cycleEnd: date(o["billingCycleEnd"]),
             totalPercentUsed: pct("totalPercentUsed"),
             autoPercentUsed: pct("autoPercentUsed"),
             apiPercentUsed: pct("apiPercentUsed"),
@@ -398,5 +463,64 @@ struct CursorQuota: Equatable {
             quota.totalPercentUsed = a
         }
         return quota
+    }
+
+    private static func number(_ value: Any?) -> Double? {
+        switch value {
+        case let number as NSNumber:
+            guard CFGetTypeID(number) != CFBooleanGetTypeID() else { return nil }
+            return number.doubleValue
+        case let string as String: return Double(string)
+        default: return nil
+        }
+    }
+
+    private static func bool(_ value: Any?) -> Bool? {
+        guard let number = value as? NSNumber, CFGetTypeID(number) == CFBooleanGetTypeID() else { return nil }
+        return number.boolValue
+    }
+
+    static func unifiedFlag(in object: [String: Any]) -> Bool? {
+        bool(object["isUnified"] ?? object["is_unified"])
+    }
+
+    static func recognizesSandStatus(in object: [String: Any]) -> Bool {
+        guard object["isUnified"] == nil, object["is_unified"] == nil else { return false }
+        guard let usage = number(object["usagePercent"]), usage.isFinite, usage >= 0 else { return false }
+        let hasValidPeriod = [
+            object["currentPeriodStart"], object["current_period_start"],
+            object["nextResetTimestampUtc"], object["next_reset_timestamp_utc"],
+        ].contains { date($0) != nil }
+        let hasPlanLabel = ["cursorPlanName", "grokPlanLabel", "billingBrand"]
+            .compactMap { object[$0] as? String }
+            .contains { !$0.isEmpty }
+        return hasValidPeriod && hasPlanLabel
+    }
+
+    private static func integer(_ value: Any?) -> Int64? {
+        switch value {
+        case let number as NSNumber:
+            guard CFGetTypeID(number) != CFBooleanGetTypeID() else { return nil }
+            return number.int64Value
+        case let string as String: return Int64(string)
+        default: return nil
+        }
+    }
+
+    private static func date(_ value: Any?) -> Date? {
+        if let string = value as? String {
+            if let date = Formatters.isoFractional.date(from: string) ?? Formatters.isoPlain.date(from: string) {
+                return date
+            }
+            if let milliseconds = Double(string), milliseconds.isFinite {
+                return Date(timeIntervalSince1970: milliseconds / 1000)
+            }
+            return nil
+        }
+        guard let number = value as? NSNumber,
+              CFGetTypeID(number) != CFBooleanGetTypeID() else { return nil }
+        let milliseconds = number.doubleValue
+        guard milliseconds.isFinite else { return nil }
+        return Date(timeIntervalSince1970: milliseconds / 1000)
     }
 }

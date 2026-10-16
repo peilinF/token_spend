@@ -4,6 +4,13 @@ import Foundation
 
 let arguments = CommandLine.arguments
 
+if let idx = arguments.firstIndex(of: "--audit-codex") {
+    let next = arguments.index(after: idx)
+    let reportURL = next < arguments.endIndex && !arguments[next].hasPrefix("-")
+        ? URL(fileURLWithPath: arguments[next]) : nil
+    exit(CodexAudit.run(reportURL: reportURL))
+}
+
 if arguments.contains("--print-summary") {
     CliMain.run()
     exit(0)
@@ -55,17 +62,24 @@ if arguments.contains("--print-waiting") {
 
 if arguments.contains("--print-quota") {
     let store = UsageStore.shared
-        if let quota = CodexQuota.decode(fromJSON: store.meta(StoreKeys.codexRateLimits)) {
-            var windows: [String] = []
-            if let w = quota.primary { windows.append("\(w.shortLabel)剩\(Int(w.leftPercent))%") }
-            if let w = quota.secondary { windows.append("\(w.shortLabel)剩\(Int(w.leftPercent))%") }
+    if let quota = CodexQuota.decode(fromJSON: store.meta(StoreKeys.codexRateLimits)) {
+        var windows: [String] = []
+        if let w = quota.primary { windows.append("\(w.shortLabel)剩\(Int(w.leftPercent))%") }
+        if let w = quota.secondary { windows.append("\(w.shortLabel)剩\(Int(w.leftPercent))%") }
         print("codex:", windows.joined(separator: " | "), quota.planType.map { "[\($0)]" } ?? "")
     } else {
         print("codex: none")
     }
     if let quota = CursorQuota.decode(fromJSON: store.meta(StoreKeys.cursorQuota)) {
         func pct(_ v: Double?) -> String { v.map { String(format: "%.0f%%", $0) } ?? "-" }
-        print("cursor: total used \(pct(quota.totalPercentUsed)), auto \(pct(quota.autoPercentUsed)), api \(pct(quota.apiPercentUsed)), cycle \(quota.cycleStart.map(Fmt.shortDate) ?? "?")~\(quota.cycleEnd.map(Fmt.shortDate) ?? "?"), used \(quota.used ?? -1)/\(quota.limit ?? -1), bonus \(quota.bonus ?? 0)")
+        let observed = store.meta(StoreKeys.cursorQuotaObservedAt)
+            .flatMap(Double.init).map { Fmt.shortDate(Date(timeIntervalSince1970: $0)) } ?? "?"
+        let reset = quota.cycleEnd.map(Fmt.shortDate) ?? "?"
+        if quota.isUnified {
+            print("cursor: shared-week used \(pct(quota.totalPercentUsed)), reset \(reset), observed \(observed)")
+        } else {
+            print("cursor: monthly total used \(pct(quota.totalPercentUsed)), auto \(pct(quota.autoPercentUsed)), api \(pct(quota.apiPercentUsed)), cycle \(quota.cycleStart.map(Fmt.shortDate) ?? "?")~\(reset), used \(quota.used ?? -1)/\(quota.limit ?? -1), bonus \(quota.bonus ?? 0), observed \(observed)")
+        }
     } else {
         print("cursor: none")
     }

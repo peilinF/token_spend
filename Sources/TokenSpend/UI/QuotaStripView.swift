@@ -23,7 +23,7 @@ struct QuotaStripView: View {
                 if let primary = quota.primary {
                     QuotaBar(
                         label: primary.shortLabel,
-                        valueText: "剩 \(Int(primary.leftPercent))%",
+                        valueText: "剩 \(Fmt.percent(primary.leftPercent))%",
                         fraction: primary.leftPercent / 100,
                         color: .codex,
                         detailText: "",
@@ -33,7 +33,7 @@ struct QuotaStripView: View {
                 if let secondary = quota.secondary {
                     QuotaBar(
                         label: secondary.shortLabel,
-                        valueText: "剩 \(Int(secondary.leftPercent))%",
+                        valueText: "剩 \(Fmt.percent(secondary.leftPercent))%",
                         fraction: secondary.leftPercent / 100,
                         color: .codex,
                         detailText: "",
@@ -42,14 +42,26 @@ struct QuotaStripView: View {
                 }
             }
             if let quota = state.cursorQuota {
-                if let auto = quota.autoPercentUsed {
-                    QuotaBar(label: "自家", valueText: "\(Int(auto))%", fraction: auto / 100, color: .cursor, detailText: "", barWidth: 32)
-                }
-                if let api = quota.apiPercentUsed {
-                    QuotaBar(label: "三方", valueText: "\(Int(api))%", fraction: api / 100, color: .cursor, detailText: "", barWidth: 32)
-                }
-                if quota.autoPercentUsed == nil && quota.apiPercentUsed == nil, let total = quota.totalPercentUsed {
-                    QuotaBar(label: "月度", valueText: "\(Int(total))%", fraction: total / 100, color: .cursor, detailText: "", barWidth: 32)
+                if quota.isUnified, let total = quota.totalPercentUsed {
+                    QuotaBar(
+                        label: quota.compactLabel,
+                        valueText: "已用\(Fmt.percent(total))%",
+                        fraction: total / 100,
+                        color: .cursor,
+                        detailText: "",
+                        barWidth: 32,
+                        helpText: "Cursor、Grok、Grok Bot 共用周额度"
+                    )
+                } else {
+                    if let auto = quota.autoPercentUsed {
+                        QuotaBar(label: "自家", valueText: "\(Fmt.percent(auto))%", fraction: auto / 100, color: .cursor, detailText: "", barWidth: 32)
+                    }
+                    if let api = quota.apiPercentUsed {
+                        QuotaBar(label: "三方", valueText: "\(Fmt.percent(api))%", fraction: api / 100, color: .cursor, detailText: "", barWidth: 32)
+                    }
+                    if quota.autoPercentUsed == nil && quota.apiPercentUsed == nil, let total = quota.totalPercentUsed {
+                        QuotaBar(label: "月度", valueText: "\(Fmt.percent(total))%", fraction: total / 100, color: .cursor, detailText: "", barWidth: 32)
+                    }
                 }
             }
             if state.codexQuota == nil && state.cursorQuota == nil {
@@ -68,13 +80,15 @@ struct QuotaBar: View {
     let color: Color
     let detailText: String
     var barWidth: CGFloat = 48
+    var labelWidth: CGFloat = 18
+    var helpText: String? = nil
 
     var body: some View {
         HStack(spacing: 5) {
             Text(label)
                 .font(.system(size: 8, weight: .bold))
                 .foregroundStyle(.secondary)
-                .frame(width: 18, alignment: .leading)
+                .frame(width: labelWidth, alignment: .leading)
             ZStack(alignment: .leading) {
                 Capsule().fill(Color.primary.opacity(0.10))
                 Capsule().fill(color.opacity(0.85)).frame(width: max(2, barWidth * CGFloat(min(1, max(0, fraction)))))
@@ -90,5 +104,6 @@ struct QuotaBar: View {
                     .lineLimit(1)
             }
         }
+        .help(helpText ?? "")
     }
 }

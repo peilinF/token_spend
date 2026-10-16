@@ -26,9 +26,15 @@ final class AppState: ObservableObject {
     @Published private(set) var cursorAuth: CursorAuthState = CursorSource.lastAuthState
     @Published private(set) var lastUpdated: Date?
     @Published private(set) var cursorLastSync: Date?
+    @Published private(set) var cursorQuotaObservedAt: Date?
+    @Published private(set) var cursorQuotaSyncError: String?
+    @Published private(set) var cursorEventsObservedAt: Date?
+    @Published private(set) var cursorLatestEventAt: Date?
+    @Published private(set) var cursorEventsSyncError: String?
     /// Last local-store failure (SQLite write). Shown in DetailView footer;
     /// nil means healthy. Distinct from cursor network/auth state.
     @Published private(set) var storeError: String?
+    @Published private(set) var codexUsageStatus: String?
     // Do not add liveRates / +xx/m. Product decision: no per-minute token rate.
     @Published private(set) var activeTools: Set<Tool> = []
     @Published private(set) var activeSince: [Tool: Date] = [:]
@@ -105,7 +111,7 @@ final class AppState: ObservableObject {
     /// Opt-in daily quota alert (default off; enable with
     /// `defaults write com.peilin.tokenspend quota_alert_enabled -bool true`).
     /// Fires at most once per day when codex weekly/5h quota drops below 20%
-    /// or cursor monthly usage tops 80%.
+    /// or Cursor shared/monthly usage tops 80%.
     private func checkQuotaAlert() {
         guard UserDefaults.standard.bool(forKey: PrefKeys.quotaAlertEnabled) else { return }
         let today = Fmt.day(Date())
@@ -116,7 +122,7 @@ final class AppState: ObservableObject {
         } else if let primary = codexQuota?.primary, primary.leftPercent < 20 {
             body = "codex \(primary.shortLabel)额度仅剩 \(Int(primary.leftPercent))%"
         } else if let used = cursorQuota?.totalPercentUsed, used > 80 {
-            body = "cursor 月度已用 \(Int(used))%"
+            body = "\(cursorQuota?.usageLabel ?? "Cursor 额度")已用 \(Int(used))%"
         }
         guard let message = body else { return }
         UserDefaults.standard.set(today, forKey: PrefKeys.quotaAlertDay)
@@ -164,9 +170,11 @@ final class AppState: ObservableObject {
         let colors = ToolColorCache.loadAll()
         ToolColorCache.replace(colors)
         toolColors = colors
+        codexUsageStatus = store.meta(StoreKeys.codexUsageStatus).flatMap { $0 == "ready" ? nil : $0 }
         if let raw = store.meta(StoreKeys.cursorLastSync), let ts = Double(raw) {
             cursorLastSync = Date(timeIntervalSince1970: ts)
         }
+        reloadCursorSyncMetadata()
         recompute()
     }
 
@@ -271,6 +279,9 @@ final class AppState: ObservableObject {
 
     private func refreshLocalSources(overlapMS: Int64) async {
         let store = self.store
+        if store.meta(StoreKeys.codexUsageVersion) != "4" {
+            codexUsageStatus = "rebuilding"
+        }
         do {
             try await Task.detached(priority: .utility) {
                 try OpenCodeSource.refresh(store: store, overlapMS: overlapMS)
@@ -282,6 +293,8 @@ final class AppState: ObservableObject {
         } catch {
             noteStoreError(error, context: "refreshLocal")
         }
+        let rawStatus = store.meta(StoreKeys.codexUsageStatus)
+        codexUsageStatus = rawStatus.flatMap { $0 == "ready" ? nil : $0 }
         recompute()
     }
 
@@ -365,7 +378,7 @@ final class AppState: ObservableObject {
         let store = self.store
         do {
             let state = try await Task.detached(priority: .utility) {
-                try await CursorSource.refresh(store: store)
+                try await CursorSource.refresh(store: store, forceCookieRefresh: force)
             }.value
             cursorAuth = state
             cursorLastSync = Date()
@@ -375,6 +388,9 @@ final class AppState: ObservableObject {
         } catch KeychainError.denied {
             cursorAuth = .keychainDenied
             applyCursorBackoff(seconds: 1800)
+        } catch CursorSource.CursorAPIError.nativeSessionUnreadable {
+            cursorAuth = .error("当前 Cursor 会话不可读，未切换浏览器账号")
+            applyCursorBackoff(seconds: 900)
         } catch CursorSource.CursorAPIError.unauthorized {
             cursorAuth = .needsRelogin
             applyCursorBackoff(seconds: 900)
@@ -401,9 +417,41 @@ final class AppState: ObservableObject {
             cursorAuth = .error("网络错误，\(Int(min(300 * pow(2, Double(cursorFailures - 1)), 3600)) / 60) 分钟后重试")
             applyCursorBackoff(seconds: min(300 * pow(2, Double(cursorFailures - 1)), 3600))
         }
+        reloadCursorSyncMetadata()
+        applyQuotaRaws(
+            codexRaw: store.meta(StoreKeys.codexRateLimits),
+            cursorRaw: store.meta(StoreKeys.cursorQuota)
+        )
         recompute()
         lastUpdated = Date()
         // No per-minute rate sampling. Do not restore liveRates / +xx/m.
+    }
+
+    private func reloadCursorSyncMetadata() {
+        func date(_ key: String) -> Date? {
+            guard let raw = store.meta(key), let seconds = Double(raw), seconds.isFinite else { return nil }
+            return Date(timeIntervalSince1970: seconds)
+        }
+        func message(_ key: String, label: String) -> String? {
+            guard let value = store.meta(key), !value.isEmpty else { return nil }
+            switch value {
+            case "unauthorized": return "\(label)需要当前 Cursor 重新登录"
+            case "native_session_missing": return "当前 Cursor 会话不可用，保留上次结果"
+            case "native_session_unreadable": return "当前 Cursor 会话不可读，未切换浏览器账号"
+            case "network": return "\(label)网络请求失败，保留上次结果"
+            case "invalid_response": return "\(label)响应无法识别，保留上次结果"
+            case "partial": return "明细只同步了部分记录"
+            default:
+                return "\(label)更新失败，保留上次结果"
+            }
+        }
+        cursorQuotaObservedAt = date(StoreKeys.cursorQuotaObservedAt)
+        cursorQuotaSyncError = message(StoreKeys.cursorQuotaError, label: "额度")
+        cursorEventsObservedAt = date(StoreKeys.cursorEventsObservedAt)
+        cursorLatestEventAt = store.meta(StoreKeys.cursorLatestEventTs)
+            .flatMap(Double.init)
+            .map { Date(timeIntervalSince1970: $0 / 1000) }
+        cursorEventsSyncError = message(StoreKeys.cursorEventsError, label: "明细")
     }
 
     private func applyWaiting(_ detected: [Tool: WaitingKind]) {

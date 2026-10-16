@@ -16,7 +16,7 @@ enum CursorAuthState: Equatable {
         switch self {
         case .unknown: return "检查中"
         case .ok: return "已连接"
-        case .needsRelogin: return "请登录 cursor.com（Chrome 或 Cursor）"
+        case .needsRelogin: return "请登录当前 Cursor 应用"
         case .keychainDenied: return "钥匙串访问被拒绝"
         case .unsupportedCookie: return "Chrome cookie 加密格式已变，可改用已登录的 Cursor 应用"
         case .noChrome: return "未找到 Chrome / Cursor"
@@ -100,11 +100,137 @@ enum CursorSource {
         return false
     }
 
-    static func refresh(store: UsageStore) async throws -> CursorAuthState {
+    static func refresh(
+        store: UsageStore,
+        forceCookieRefresh: Bool = false,
+        sessionProvider: () throws -> CursorNativeSession = { try CursorNativeSession.read() }
+    ) async throws -> CursorAuthState {
+        do {
+            let nativeSession = try sessionProvider()
+            return try await refresh(nativeSession: nativeSession, store: store)
+        } catch CursorRPCError.missingSession {
+            // Older installs may not have a usable native Cursor session.
+            // Keep the previous cookie path for those installs only.
+            if hasUnifiedQuotaCache(store: store) {
+                try store.applySourceChanges(source: .cursor, meta: [
+                    StoreKeys.cursorQuotaError: "native_session_missing",
+                    StoreKeys.cursorEventsError: "native_session_missing",
+                ])
+                lastAuthState = .needsRelogin
+                throw CursorAPIError.unauthorized
+            }
+        } catch CursorRPCError.invalidSession {
+            // A present but expired/malformed native token must not silently
+            // switch to a potentially different Chrome account.
+            try store.applySourceChanges(source: .cursor, meta: [
+                StoreKeys.cursorQuotaError: "unauthorized",
+                StoreKeys.cursorEventsError: "unauthorized",
+            ])
+            lastAuthState = .needsRelogin
+            throw CursorAPIError.unauthorized
+        } catch CursorRPCError.unreadableSession {
+            try store.applySourceChanges(source: .cursor, meta: [
+                StoreKeys.cursorQuotaError: "native_session_unreadable",
+                StoreKeys.cursorEventsError: "native_session_unreadable",
+            ])
+            lastAuthState = .error("当前 Cursor 会话不可读，未切换浏览器账号")
+            throw CursorAPIError.nativeSessionUnreadable
+        }
+
+        return try await refreshLegacyCookie(store: store, forceCookieRefresh: forceCookieRefresh)
+    }
+
+    static func refresh(
+        nativeSession: CursorNativeSession,
+        store: UsageStore,
+        rpc injectedRPC: CursorRPC? = nil
+    ) async throws -> CursorAuthState {
+        let rpc = injectedRPC ?? CursorRPC(session: nativeSession)
+        var quotaSucceeded = false
+        var eventsSucceeded = false
+        var quotaUnauthorized = false
+        var eventsUnauthorized = false
+
+        do {
+            let data = try await rpc.call(method: .getSandUsageStatus)
+            guard let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+                  let raw = String(data: data, encoding: .utf8) else {
+                throw CursorAPIError.badResponse
+            }
+            let unifiedFlag = CursorQuota.unifiedFlag(in: json)
+            if unifiedFlag == true {
+                guard CursorQuota.decode(fromJSON: raw)?.isUnified == true else {
+                    throw CursorAPIError.badResponse
+                }
+                try persistQuota(raw: raw, store: store, observedAt: Date())
+            } else {
+                // ProtoJSON omits default false booleans. Accept that older
+                // shape only when it is otherwise a recognizable Sand status
+                // and no known shared snapshot could be downgraded.
+                guard unifiedFlag == false
+                    || (CursorQuota.recognizesSandStatus(in: json) && !hasUnifiedQuotaCache(store: store)) else {
+                    throw CursorAPIError.badResponse
+                }
+                let legacyData = try await rpc.call(method: .getCurrentPeriodUsage)
+                guard let legacyRaw = String(data: legacyData, encoding: .utf8),
+                      let legacyQuota = CursorQuota.decode(fromJSON: legacyRaw), !legacyQuota.isUnified else {
+                    throw CursorAPIError.badResponse
+                }
+                try persistQuota(raw: legacyRaw, store: store, observedAt: Date())
+            }
+            quotaSucceeded = true
+        } catch CursorRPCError.unauthorized {
+            quotaUnauthorized = true
+            try recordFailure(StoreKeys.cursorQuotaError, value: "unauthorized", store: store)
+        } catch let error as CursorRPCError {
+            try recordFailure(StoreKeys.cursorQuotaError, value: failureCode(error), store: store)
+        } catch CursorAPIError.badResponse {
+            try recordFailure(StoreKeys.cursorQuotaError, value: "invalid_response", store: store)
+        } catch let error as SQLiteError {
+            throw error
+        } catch {
+            try recordFailure(StoreKeys.cursorQuotaError, value: "network", store: store)
+        }
+
+        do {
+            let result = try await syncEvents(store: store) { body in
+                let data = try JSONSerialization.data(withJSONObject: body)
+                return try await rpc.call(method: .getFilteredUsageEvents, body: data)
+            }
+            eventsSucceeded = true
+            try recordEventSuccess(result, store: store)
+        } catch CursorRPCError.unauthorized {
+            eventsUnauthorized = true
+            try recordFailure(StoreKeys.cursorEventsError, value: "unauthorized", store: store)
+        } catch let error as CursorRPCError {
+            try recordFailure(StoreKeys.cursorEventsError, value: failureCode(error), store: store)
+        } catch CursorAPIError.unauthorized {
+            eventsUnauthorized = true
+            try recordFailure(StoreKeys.cursorEventsError, value: "unauthorized", store: store)
+        } catch let error as SQLiteError {
+            throw error
+        } catch {
+            try recordFailure(StoreKeys.cursorEventsError, value: "network", store: store)
+        }
+
+        if quotaUnauthorized || eventsUnauthorized {
+            lastAuthState = .needsRelogin
+            throw CursorAPIError.unauthorized
+        }
+        if quotaSucceeded || eventsSucceeded {
+            try store.setMeta(StoreKeys.cursorLastSync, String(Date().timeIntervalSince1970))
+            let state = CursorAuthState.ok(cookieExpiry: nativeSession.expiresAt)
+            lastAuthState = state
+            return state
+        }
+        throw CursorAPIError.http(503)
+    }
+
+    private static func refreshLegacyCookie(store: UsageStore, forceCookieRefresh: Bool) async throws -> CursorAuthState {
         let cookie: String
         let expiry: Date?
         do {
-            (cookie, expiry) = try getCachedCookie()
+            (cookie, expiry) = try getCachedCookie(forceRefresh: forceCookieRefresh)
         } catch KeychainError.denied {
             lastAuthState = .keychainDenied
             throw KeychainError.denied
@@ -118,12 +244,17 @@ enum CursorSource {
             throw CursorAPIError.noCookie
         }
         do {
-            try await syncEvents(cookie: cookie, store: store)
+            let result = try await syncEvents(store: store) { body in
+                try await postEventPage(cookie: cookie, body: body)
+            }
+            try recordEventSuccess(result, store: store)
             // Quota summary is best-effort: its failure must not fail the sync.
             // Network errors are ignored; store write errors are logged.
             if let summary = try? await fetchUsageSummary(cookie: cookie) {
                 do {
-                    try persistQuotaSummary(summary, store: store)
+                    try persistQuotaSummary(summary, store: store, observedAt: Date())
+                } catch let error as SQLiteError {
+                    throw error
                 } catch {
                     Diagnostics.recordStoreError(error, context: "cursor.persistQuota")
                 }
@@ -153,10 +284,53 @@ enum CursorSource {
         return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
     }
 
-    private static func persistQuotaSummary(_ json: [String: Any], store: UsageStore) throws {
+    private static func persistQuotaSummary(_ json: [String: Any], store: UsageStore, observedAt: Date) throws {
         guard let data = try? JSONSerialization.data(withJSONObject: json),
               let raw = String(data: data, encoding: .utf8), !raw.isEmpty else { return }
-        try store.setMeta(StoreKeys.cursorQuota, raw)
+        if CursorQuota.decode(fromJSON: store.meta(StoreKeys.cursorQuota))?.isUnified == true { return }
+        try persistQuota(raw: raw, store: store, observedAt: observedAt)
+    }
+
+    private static func hasUnifiedQuotaCache(store: UsageStore) -> Bool {
+        guard let raw = store.meta(StoreKeys.cursorQuota), let data = raw.data(using: .utf8),
+              let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return false }
+        return CursorQuota.unifiedFlag(in: object) == true
+    }
+
+    private static func persistQuota(raw: String, store: UsageStore, observedAt: Date) throws {
+        guard CursorQuota.decode(fromJSON: raw) != nil else { throw CursorAPIError.badResponse }
+        try store.applySourceChanges(source: .cursor, meta: [
+            StoreKeys.cursorQuota: raw,
+            StoreKeys.cursorQuotaObservedAt: String(observedAt.timeIntervalSince1970),
+            StoreKeys.cursorQuotaError: "",
+        ])
+    }
+
+    private static func failureCode(_ error: CursorRPCError) -> String {
+        switch error {
+        case .unauthorized: return "unauthorized"
+        case .http(let status): return "http_\(status)"
+        case .missingSession, .invalidSession: return "session"
+        case .unreadableSession: return "native_session_unreadable"
+        case .invalidResponse: return "invalid_response"
+        }
+    }
+
+    private static func recordFailure(_ key: String, value: String, store: UsageStore) throws {
+        try store.applySourceChanges(source: .cursor, meta: [key: value])
+    }
+
+    private static func recordEventSuccess(_ result: EventSyncResult, store: UsageStore) throws {
+        let observed = Date().timeIntervalSince1970
+        let previous = store.meta(StoreKeys.cursorLatestEventTs).flatMap(Double.init) ?? 0
+        var meta = [
+            StoreKeys.cursorEventsObservedAt: String(observed),
+            StoreKeys.cursorEventsError: result.isComplete ? "" : "partial",
+        ]
+        if result.latestEventTimestampMs > 0 {
+            meta[StoreKeys.cursorLatestEventTs] = String(max(previous, result.latestEventTimestampMs))
+        }
+        try store.applySourceChanges(source: .cursor, meta: meta)
     }
 
     static var lastAuthState: CursorAuthState = .unknown
@@ -166,13 +340,20 @@ enum CursorSource {
     private static let cookieLock = NSLock()
     private static var cachedCookie: String?
     private static var cachedExpiry: Date?
+    private static var cachedAt: Date?
+    /// Chrome rotates the session cookie when the user switches cursor.com
+    /// accounts; a cache that lives until expiry would pin sync to the old
+    /// account for weeks. Re-extract periodically instead — with "always
+    /// allow" granted the keychain read is silent.
+    private static let cookieCacheTTL: TimeInterval = 30 * 60
 
-    private static func getCachedCookie() throws -> (String, Date?) {
+    private static func getCachedCookie(forceRefresh: Bool = false) throws -> (String, Date?) {
         cookieLock.lock()
         defer { cookieLock.unlock() }
-        if let cached = cachedCookie {
+        if !forceRefresh, let cached = cachedCookie, let cachedAt {
+            let stale = Date().timeIntervalSince(cachedAt) > cookieCacheTTL
             let nearExpiry = cachedExpiry.map { $0 <= Date().addingTimeInterval(6 * 3600) } ?? false
-            if !nearExpiry {
+            if !stale && !nearExpiry {
                 return (cached, cachedExpiry)
             }
         }
@@ -180,6 +361,7 @@ enum CursorSource {
             let fresh = try extractSessionCookie()
             cachedCookie = fresh
             cachedExpiry = currentCookieExpiry
+            cachedAt = Date()
             return (fresh, currentCookieExpiry)
         } catch {
             // Never silently mask revocation/expiry: a stale cache is only
@@ -207,6 +389,7 @@ enum CursorSource {
 
     enum CursorAPIError: Error {
         case unauthorized
+        case nativeSessionUnreadable
         case noCookie
         case unsupportedCookie
         case http(Int)
@@ -215,15 +398,25 @@ enum CursorSource {
 
     private static func migrateKeysIfNeeded(store: UsageStore) throws {
         guard store.meta(StoreKeys.cursorKeyV2) != "1" else { return }
-        try store.deleteAll(source: .cursor)
-        try store.setMeta(StoreKeys.cursorLastTs, "")
+        // Event IDs are compatible with the already persisted Cursor rows.
+        // Never clear usage history or its watermark during account/API changes.
         try store.setMeta(StoreKeys.cursorKeyV2, "1")
     }
 
-    private static func syncEvents(cookie: String, store: UsageStore) async throws {
+    struct EventSyncResult: Equatable {
+        let latestEventTimestampMs: Double
+        let isComplete: Bool
+    }
+
+    typealias EventPageLoader = ([String: Any]) async throws -> Data
+
+    static func syncEvents(
+        store: UsageStore,
+        now: Date = Date(),
+        loadPage: @escaping EventPageLoader
+    ) async throws -> EventSyncResult {
         try migrateKeysIfNeeded(store: store)
 
-        let now = Date()
         var existing = store.meta(StoreKeys.cursorLastTs).flatMap { Double($0) } ?? 0
         let incremental = existing > 0
         var startMs: Double
@@ -246,6 +439,7 @@ enum CursorSource {
         var fetched = 0
         var total = Int.max
         var maxTs: Double = existing
+        var latestEventTs: Double = store.meta(StoreKeys.cursorLatestEventTs).flatMap(Double.init) ?? 0
         var previousPageMinTs: Double = 0
         var storedAccount = store.meta(StoreKeys.cursorAccountId) ?? ""
         var detectedAccount: String?
@@ -259,15 +453,15 @@ enum CursorSource {
                 "page": page,
                 "pageSize": 200,
             ]
-            let data = try await postEventPage(cookie: cookie, body: body)
+            let data = try await loadPage(body)
             guard let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
                 throw CursorAPIError.badResponse
             }
             if let err = json["error"] as? String, err == "not_authenticated" {
                 throw CursorAPIError.unauthorized
             }
-            total = (json["totalUsageEventsCount"] as? NSNumber)?.intValue ?? 0
-            guard let events = json["usageEventsDisplay"] as? [[String: Any]] else {
+            total = toInt(json["totalUsageEventsCount"]) ?? (json.isEmpty ? 0 : Int.max)
+            guard let events = json["usageEventsDisplay"] as? [[String: Any]] ?? (json.isEmpty ? [] : nil) else {
                 throw CursorAPIError.badResponse
             }
 
@@ -286,6 +480,7 @@ enum CursorSource {
                 guard let tsStr = event["timestamp"] as? String, let ts = Double(tsStr) else { continue }
                 pageMinTs = min(pageMinTs, ts)
                 pageMaxTs = max(pageMaxTs, ts)
+                latestEventTs = max(latestEventTs, ts)
 
                 let tokenUsage = event["tokenUsage"] as? [String: Any] ?? [:]
                 var amount = UsageAmount()
@@ -355,6 +550,7 @@ enum CursorSource {
         if let account = detectedAccount, !account.isEmpty {
             try store.setMeta(StoreKeys.cursorAccountId, account)
         }
+        return EventSyncResult(latestEventTimestampMs: latestEventTs, isComplete: complete)
     }
 
     private static func eventKey(
@@ -370,6 +566,14 @@ enum CursorSource {
         }
         let legacy = "\(Int64(ts))|\(conv)|\(kind)"
         return account.map { "\($0)|\(legacy)" } ?? legacy
+    }
+
+    private static func toInt(_ value: Any?) -> Int? {
+        switch value {
+        case let number as NSNumber: return number.intValue
+        case let string as String: return Int(string)
+        default: return nil
+        }
     }
 
     private static func eventCost(_ event: [String: Any]) -> Double {
@@ -646,6 +850,7 @@ enum ChromeCrypto {
 private func toInt64(_ v: Any?) -> Int64 {
     switch v {
     case let n as NSNumber: return n.int64Value
+    case let s as String: return Int64(s) ?? 0
     default: return 0
     }
 }

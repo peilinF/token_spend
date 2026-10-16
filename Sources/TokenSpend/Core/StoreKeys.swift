@@ -16,7 +16,7 @@ enum PrefKeys {
     static let priceInputPer1M = "price_input_per_1m"
     static let priceOutputPer1M = "price_output_per_1m"
     /// Default off. When on, posts a local notification once per day when
-    /// codex weekly quota drops below 20% or cursor monthly usage tops 80%.
+    /// codex quota drops below 20% or Cursor shared/monthly usage tops 80%.
     static let quotaAlertEnabled = "quota_alert_enabled"
     static let quotaAlertDay = "quota_alert_day"
     static func color(for tool: Tool) -> String { "color_\(tool.rawValue)" }
@@ -30,7 +30,14 @@ enum StoreKeys {
     static let cursorLastTs = "cursor_last_ts"
     static let cursorKeyV2 = "cursor_key_v2"
     static let cursorAccountId = "cursor_account_id"
+    static let cursorQuotaObservedAt = "cursor_quota_observed_at"
+    static let cursorQuotaError = "cursor_quota_error"
+    static let cursorEventsObservedAt = "cursor_events_observed_at"
+    static let cursorLatestEventTs = "cursor_latest_event_ts"
+    static let cursorEventsError = "cursor_events_error"
     static let codexUsageVersion = "codex_usage_version"
+    static let codexUsageStatus = "codex_usage_status"
+    static func codexCursorState(_ path: String) -> String { "codex_cursor:" + path }
     static func codexSig(_ path: String) -> String { "codex_sig:" + path }
     static func codexOff(_ path: String) -> String { "codex_off:" + path }
     static func codexBaseline(_ path: String) -> String { "codex_baseline:" + path }

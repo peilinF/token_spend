@@ -42,6 +42,9 @@ struct DetailView: View {
             if let storeError = state.storeError {
                 storeErrorBanner(storeError)
             }
+            if let codexStatus = state.codexUsageStatus {
+                codexUsageBanner(codexStatus)
+            }
             Picker("", selection: Binding(get: { state.period }, set: { state.period = $0 })) {
                 ForEach(Period.allCases, id: \.self) { Text($0.shortName).tag($0) }
             }
@@ -58,6 +61,9 @@ struct DetailView: View {
                     .font(.system(size: 9))
                     .foregroundStyle(.secondary)
             }
+            Text("token 数量，不等同费用或账户额度")
+                .font(.system(size: 9))
+                .foregroundStyle(.secondary)
         }
     }
 
@@ -103,6 +109,42 @@ struct DetailView: View {
         .padding(.vertical, 5)
         .background(RoundedRectangle(cornerRadius: 8).fill(Color.red.opacity(0.12)))
         .accessibilityLabel("本地存储异常：" + message)
+    }
+
+    private func codexUsageBanner(_ status: String) -> some View {
+        let message: String
+        if status == "rebuilding" {
+            message = "Codex 统计正在重算"
+        } else if status.hasPrefix("incomplete:") {
+            message = "Codex 统计未完成，保留上次结果"
+        } else {
+            message = "Codex 统计状态：" + status
+        }
+        return HStack(spacing: 6) {
+            Image(systemName: status == "rebuilding" ? "arrow.triangle.2.circlepath" : "exclamationmark.triangle")
+                .font(.system(size: 10, weight: .bold))
+                .foregroundColor(.orange)
+            Text(message)
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundColor(.orange)
+                .lineLimit(2)
+                .fixedSize(horizontal: false, vertical: true)
+                .multilineTextAlignment(.leading)
+            Spacer(minLength: 0)
+            if status.hasPrefix("incomplete:") {
+                Button {
+                    Task { await state.refreshLocal() }
+                } label: {
+                    Text("重试")
+                        .font(.system(size: 10, weight: .bold))
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 5)
+        .background(RoundedRectangle(cornerRadius: 8).fill(Color.orange.opacity(0.12)))
+        .accessibilityLabel(message)
     }
 
     private var sortedWaiting: [(tool: Tool, info: WaitingInfo)] {        state.waiting
@@ -159,7 +201,7 @@ struct DetailView: View {
         return VStack(spacing: 3) {
             HStack(spacing: 6) {
                 Circle().fill(item.tool.color).frame(width: 7, height: 7)
-                Text(item.tool.displayName)
+                Text(item.tool == .cursor && state.cursorQuota?.isUnified == true ? "Cursor / Grok" : item.tool.displayName)
                     .font(.system(size: 11, weight: .medium))
                 if state.activeTools.contains(item.tool) {
                     Circle()
@@ -234,14 +276,14 @@ struct DetailView: View {
         VStack(alignment: .leading, spacing: 3) {
             if let window = quota.primary {
                 QuotaBar(
-                    label: window.shortLabel, valueText: "剩 \(Int(window.leftPercent))%",
+                    label: window.shortLabel, valueText: "剩 \(Fmt.percent(window.leftPercent))%",
                     fraction: window.leftPercent / 100, color: .codex,
                     detailText: window.resetText, barWidth: 110
                 )
             }
             if let window = quota.secondary {
                 QuotaBar(
-                    label: window.shortLabel, valueText: "剩 \(Int(window.leftPercent))%",
+                    label: window.shortLabel, valueText: "剩 \(Fmt.percent(window.leftPercent))%",
                     fraction: window.leftPercent / 100, color: .codex,
                     detailText: window.resetText, barWidth: 110
                 )
@@ -252,45 +294,89 @@ struct DetailView: View {
 
     private func cursorQuotaBlock(_ quota: CursorQuota) -> some View {
         VStack(alignment: .leading, spacing: 3) {
-            HStack(spacing: 6) {
-                Text("月度")
-                    .font(.system(size: 9, weight: .bold))
+            if quota.isUnified {
+                QuotaBar(
+                    label: "共享周",
+                    valueText: "已用 \(Fmt.percent(quota.totalPercentUsed ?? 0))%",
+                    fraction: (quota.totalPercentUsed ?? 0) / 100,
+                    color: .cursor,
+                    detailText: quota.cycleEnd.map { "重置 " + Fmt.shortDate($0) } ?? "",
+                    barWidth: 76,
+                    labelWidth: 36,
+                    helpText: "Cursor、Grok、Grok Bot 共用周额度"
+                )
+                Text(quota.sharedToolsDescription ?? "Cursor、Grok、Grok Bot 共用")
+                    .font(.system(size: 8))
                     .foregroundStyle(.secondary)
-                    .frame(width: 18, alignment: .leading)
-                ZStack(alignment: .leading) {
-                    Capsule().fill(Color.primary.opacity(0.06))
-                    Capsule()
-                        .fill(Color.cursor.opacity(0.85))
-                        .frame(width: max(2, 110 * CGFloat(min(1, (quota.totalPercentUsed ?? 0) / 100))))
-                }
-                .frame(width: 110, height: 4)
-                Text("已用 \(Int(quota.totalPercentUsed ?? 0))%")
-                    .font(.system(size: 9, weight: .semibold))
-                    .monospacedDigit()
-                Spacer(minLength: 4)
-                if let end = quota.cycleEnd {
-                    Text("至 " + Fmt.shortDate(end))
+                    .padding(.leading, 42)
+                Text(tokenCoverageText)
+                    .font(.system(size: 8))
+                    .foregroundStyle(.tertiary)
+                    .padding(.leading, 42)
+                if let error = state.cursorQuotaSyncError {
+                    Text(error)
+                        .font(.system(size: 8))
+                        .foregroundStyle(.orange)
+                        .padding(.leading, 42)
+                } else if let observed = state.cursorQuotaObservedAt {
+                    Text("额度查询 " + Fmt.time(observed))
                         .font(.system(size: 8))
                         .foregroundStyle(.tertiary)
+                        .padding(.leading, 42)
                 }
-            }
-            HStack(spacing: 6) {
-                poolLine("自家模型池", percent: quota.autoPercentUsed)
-                poolLine("三方模型池", percent: quota.apiPercentUsed)
-                if let bonus = quota.bonus, bonus > 0 {
-                    Text("+bonus").font(.system(size: 8)).foregroundStyle(.tertiary)
+                if let error = state.cursorEventsSyncError {
+                    Text(error)
+                        .font(.system(size: 8))
+                        .foregroundStyle(.orange)
+                        .padding(.leading, 42)
                 }
-                Spacer(minLength: 0)
+            } else {
+                HStack(spacing: 6) {
+                    Text("月度")
+                        .font(.system(size: 9, weight: .bold))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 28, alignment: .leading)
+                    ZStack(alignment: .leading) {
+                        Capsule().fill(Color.primary.opacity(0.06))
+                        Capsule()
+                            .fill(Color.cursor.opacity(0.85))
+                            .frame(width: max(2, 110 * CGFloat(min(1, (quota.totalPercentUsed ?? 0) / 100))))
+                    }
+                    .frame(width: 110, height: 4)
+                    Text("已用 \(Fmt.percent(quota.totalPercentUsed ?? 0))%")
+                        .font(.system(size: 9, weight: .semibold))
+                        .monospacedDigit()
+                    Spacer(minLength: 4)
+                    if let end = quota.cycleEnd {
+                        Text("至 " + Fmt.shortDate(end))
+                            .font(.system(size: 8))
+                            .foregroundStyle(.tertiary)
+                    }
+                }
+                HStack(spacing: 6) {
+                    poolLine("自家模型池", percent: quota.autoPercentUsed)
+                    poolLine("三方模型池", percent: quota.apiPercentUsed)
+                    if let bonus = quota.bonus, bonus > 0 {
+                        Text("+bonus").font(.system(size: 8)).foregroundStyle(.tertiary)
+                    }
+                    Spacer(minLength: 0)
+                }
+                .padding(.leading, 34)
             }
-            .padding(.leading, 24)
         }
         .padding(.leading, 13)
+    }
+
+    private var tokenCoverageText: String {
+        let latest = state.cursorLatestEventAt.map { "，最新 \(Fmt.shortDate($0))" } ?? "，暂无已返回记录"
+        let observed = state.cursorEventsObservedAt.map { "（查询 \(Fmt.time($0))）" } ?? ""
+        return "Token 按已返回明细统计\(latest)\(observed)"
     }
 
     @ViewBuilder
     private func poolLine(_ name: String, percent: Double?) -> some View {
         if let percent {
-            Text("\(name) 已用 \(Int(percent))%")
+            Text("\(name) 已用 \(Fmt.percent(percent))%")
                 .font(.system(size: 8))
                 .foregroundStyle(.secondary)
         }

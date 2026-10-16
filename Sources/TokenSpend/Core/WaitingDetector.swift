@@ -697,6 +697,14 @@ enum WaitingDetector {
             return .permission
         }
 
+        // Subagents execute in the extension host, outside the main request
+        // trace: while one runs, the main trace log goes quiet and the stall
+        // check below would mistake that silence for a stuck agent. An open
+        // subagent means work is progressing, not waiting.
+        if hasOpenSubagent(newerThan: now.addingTimeInterval(-3600)) {
+            return nil
+        }
+
         let activeCutoff = now.addingTimeInterval(-1800)
 
         for (log, mtime) in CursorLogs.requestTraceLogs(newerThan: activeCutoff).prefix(3) {
@@ -733,6 +741,43 @@ enum WaitingDetector {
             if hasPendingAgentApproval(log) { return true }
         }
         return false
+    }
+
+    /// "subagent inherit applied child=<id>" pairs with "cleared" for the same
+    /// child id (seen in Cursor Agent Exec.log). An applied without a cleared
+    /// still pending means a subagent is mid-run. Pattern-matched (not an
+    /// allowlist) like the terminal-span check, so renames of the surrounding
+    /// prose keep working as long as the inherit/child= shape survives.
+    private static func hasOpenSubagent(newerThan cutoff: Date) -> Bool {
+        for (log, _) in CursorLogs.agentExecLogs(newerThan: cutoff).prefix(6) {
+            if subagentTailOpen(log) { return true }
+        }
+        return false
+    }
+
+    private static func subagentTailOpen(_ url: URL) -> Bool {
+        FileResultCache.shared.value(for: url, namespace: "cursor_subagent") {
+            guard let handle = try? FileHandle(forReadingFrom: url) else { return false }
+            defer { try? handle.close() }
+            let size = Int64((try? handle.seekToEnd()) ?? 0)
+            let readStart = max(0, size - 262_144)
+            try? handle.seek(toOffset: UInt64(readStart))
+            guard let data = try? handle.readToEnd(),
+                  let text = String(data: data, encoding: .utf8) else { return false }
+
+            var open: Set<String> = []
+            for line in text.split(separator: "\n") {
+                guard line.contains("subagent inherit"),
+                      let range = line.range(of: "child=") else { continue }
+                let id = line[range.upperBound...].prefix(while: { $0 != " " && $0 != "\t" })
+                if line.contains("applied") {
+                    open.insert(String(id))
+                } else if line.contains("cleared") {
+                    open.remove(String(id))
+                }
+            }
+            return !open.isEmpty
+        }
     }
 
     private static func hasPendingAgentApproval(_ url: URL) -> Bool {

@@ -41,15 +41,23 @@ enum Fmt {
 
     static func tokens(_ n: Int64) -> String {
         let v = Double(n)
-        if v < 1000 { return "\(n)" }
-        if v < 1_000_000 { return trim(v / 1_000) + "k" }
-        if v < 1_000_000_000 { return trim(v / 1_000_000) + "M" }
-        return trim(v / 1_000_000_000) + "B"
+        if v < 10_000 { return "\(n)" }
+        if v < 100_000_000 { return trim(v / 10_000) + "万" }
+        return trim(v / 100_000_000) + "亿"
     }
 
     private static func trim(_ v: Double) -> String {
         if v >= 100 { return String(format: "%.0f", v) }
         if v >= 10 { return String(format: "%.1f", v) }
+        return String(format: "%.2f", v)
+    }
+
+    /// Quota percentages. Small values keep decimals on purpose: a fresh
+    /// billing cycle at 0.3% must not render as "0%" (that read as "quota
+    /// not showing" right after a cursor account switch).
+    static func percent(_ v: Double) -> String {
+        if v >= 10 { return String(format: "%.0f", v) }
+        if v >= 1 { return String(format: "%.1f", v) }
         return String(format: "%.2f", v)
     }
 
